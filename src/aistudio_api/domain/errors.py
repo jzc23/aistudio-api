@@ -113,6 +113,25 @@ def is_transient_rpc_error(exc: Exception) -> bool:
     return False
 
 
+def is_retryable_stream_fetch_error(exc: Exception) -> bool:
+    """识别页面内流式 fetch 在收到响应头之前的瞬时网络失败（如 Failed to fetch）。
+
+    典型诱因是连接被重置、DNS/TLS 抖动或页面导航竞争；该阶段尚未产生任何
+    输出字节，重试不会重复计费。判定依据是传输层在异常消息中注入的
+    errName/phase/gotStatus 现场标记（errName=TypeError 排除主动 abort
+    与超时等其他来源）。
+    """
+    if isinstance(exc, RuntimeError):
+        msg = str(exc)
+        return (
+            msg.startswith("streaming request failed:")
+            and "errName=TypeError" in msg
+            and "phase=fetch" in msg
+            and "gotStatus=False" in msg
+        )
+    return False
+
+
 def is_browser_session_hang_error(exc: Exception) -> bool:
     """识别由于 CDP 断开、模板捕获超时或 BotGuard 握手未就绪引起的会话挂起异常。"""
     if isinstance(exc, (RuntimeError, TimeoutError)):

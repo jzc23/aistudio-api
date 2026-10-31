@@ -253,9 +253,47 @@ class XHRStreamTransport:
         )
         await page.evaluate(STREAMING_INIT_JS, init_args)
 
-        deadline = asyncio.get_running_loop().time() + timeout_s
+        start_time = asyncio.get_running_loop().time()
+        deadline = start_time + timeout_s
         status_sent = False
         is_terminal = False
+        chunk_count = 0
+        byte_count = 0
+
+        def _raise_stream_error(event: dict[str, object]) -> None:
+            """带完整现场上下文抛出流式失败异常（探针日志 + 分类器判据）。
+
+            消息中的 errName/phase/gotStatus 标记供
+            is_retryable_stream_fetch_error 判定是否可安全重试。
+            """
+            message = str(event.get("message") or "unknown error")
+            err_name = str(event.get("errName") or "unknown")
+            phase = str(event.get("phase") or ("fetch" if not status_sent else "read"))
+            attempts = int(str(event.get("attempts") or 1))
+            got_status = bool(event.get("gotStatus", status_sent))
+            js_bytes = int(str(event.get("bytes") or 0))
+            elapsed_ms = (asyncio.get_running_loop().time() - start_time) * 1000
+            logger.warning(
+                "流式请求失败 (rid=%s): %s | errName=%s phase=%s attempts=%d "
+                "gotStatus=%s chunks=%d bytes=%d(js=%d) elapsedMs=%.0f inFlight=%d",
+                rid,
+                message,
+                err_name,
+                phase,
+                attempts,
+                got_status,
+                chunk_count,
+                byte_count,
+                js_bytes,
+                elapsed_ms,
+                self.in_flight_count,
+            )
+            raise RuntimeError(
+                f"streaming request failed: {message} "
+                f"[errName={err_name}, phase={phase}, attempts={attempts}, "
+                f"gotStatus={got_status}, chunks={chunk_count}, bytes={byte_count}, "
+                f"elapsedMs={elapsed_ms:.0f}]"
+            )
 
         try:
             while not is_terminal:
@@ -284,11 +322,24 @@ class XHRStreamTransport:
                 elif etype == "chunk":
                     text = str(event.get("text") or "")
                     if text:
-                        yield ("chunk", text.encode("utf-8"))
+                        data = text.encode("utf-8")
+                        chunk_count += 1
+                        byte_count += len(data)
+                        yield ("chunk", data)
                         deadline = asyncio.get_running_loop().time() + timeout_s
+                elif etype == "probe":
+                    logger.info(
+                        "流式探针 (rid=%s): %s attempt=%s errName=%s errMessage=%s"
+                        " elapsedMs=%s",
+                        rid,
+                        str(event.get("probe") or ""),
+                        str(event.get("attempt") or ""),
+                        str(event.get("errName") or ""),
+                        str(event.get("errMessage") or ""),
+                        str(event.get("elapsedMs") or ""),
+                    )
                 elif etype == "error":
-                    message = str(event.get("message") or "unknown error")
-                    raise RuntimeError(f"streaming request failed: {message}")
+                    _raise_stream_error(event)
                 elif etype in ("done", "aborted"):
                     while not queue.empty():
                         try:

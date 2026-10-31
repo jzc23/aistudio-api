@@ -25,6 +25,7 @@ from aistudio_api.domain.errors import (
     SessionExpiredError,
     UsageLimitExceeded,
     is_browser_session_hang_error,
+    is_retryable_stream_fetch_error,
     is_transient_rpc_error,
     parse_upstream_grpc_error,
 )
@@ -312,6 +313,22 @@ async def handle_attempt_exception(
         )
         client.clear_templates()
         retry("transient_rpc_404")
+        return True
+
+    # 页面内流式 fetch 瞬时网络失败（连接重置 / DNS 抖动 / 页面导航竞争）：
+    # 发生在收到响应头之前、零字节输出，同账号立即重试绝对安全，严禁切号。
+    if (
+        is_retryable_stream_fetch_error(exc)
+        and not has_yielded_data
+        and attempt < MAX_RETRIES - 1
+    ):
+        logger.warning(
+            "流式请求瞬时网络失败，同账号立即重试 (%d/%d): %s",
+            attempt + 1,
+            MAX_RETRIES,
+            exc,
+        )
+        retry("stream_fetch_transient")
         return True
 
     if is_browser_session_hang_error(exc):
