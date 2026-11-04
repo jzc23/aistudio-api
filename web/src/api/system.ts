@@ -205,10 +205,16 @@ export const systemApi = {
     })
   },
 
-  updateConfigYaml(yamlContent: string): Promise<{ ok: boolean; message: string }> {
+  updateConfigYaml(
+    yamlContent: string,
+    baseYamlContent?: string,
+  ): Promise<{ ok: boolean; message: string; preserved_keys?: string[] }> {
     return request('/config/yaml', {
       method: 'PUT',
-      body: JSON.stringify({ yaml_content: yamlContent }),
+      body: JSON.stringify({
+        yaml_content: yamlContent,
+        ...(baseYamlContent !== undefined ? { base_yaml_content: baseYamlContent } : {}),
+      }),
     })
   },
 

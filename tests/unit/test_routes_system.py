@@ -230,3 +230,53 @@ model_defaults:
         assert any(item["key"] == "sk-test-fixed-001" for item in items)
 
     assert "sk-test-fixed-001" in config_file.read_text(encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_config_yaml_save_three_way_logging_merge(monkeypatch, tmp_path):
+    """日志段三方合并：未动快照保留外部修改；主动编辑尊重提交值；无基线不保护。"""
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        "logging:\n  level: INFO\nmodel_defaults:\n  models: {}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AISTUDIO_CONFIG_FILE", str(config_file))
+    from aistudio_api.infrastructure.gateway.model_defaults import (
+        invalidate_config_cache,
+    )
+
+    invalidate_config_cache()
+    baseline = config_file.read_text(encoding="utf-8")
+
+    async with _client() as client:
+        # 外部入口修改日志（日志设置卡片走的就是这个接口）
+        resp = await client.put("/config/logging", json={"level": "DEBUG"})
+        assert resp.status_code == 200
+
+        # 场景1: 编辑器快照未动 logging（提交值 == 基线）→ 保留磁盘上的 DEBUG
+        saved = await client.put(
+            "/config/yaml",
+            json={"yaml_content": baseline, "base_yaml_content": baseline},
+        )
+        assert saved.status_code == 200
+        assert "logging" in saved.json()["preserved_keys"]
+        assert "DEBUG" in config_file.read_text(encoding="utf-8")
+
+        # 场景2: 用户在编辑器中主动把 logging 改为 WARNING → 尊重提交值
+        edited = baseline.replace("level: INFO", "level: WARNING")
+        saved2 = await client.put(
+            "/config/yaml",
+            json={"yaml_content": edited, "base_yaml_content": baseline},
+        )
+        assert saved2.status_code == 200
+        assert "logging" not in saved2.json().get("preserved_keys", [])
+        assert "WARNING" in config_file.read_text(encoding="utf-8")
+
+        # 场景3: 外部再次修改后，不带基线（旧客户端）→ logging 保持旧行为不保护
+        resp3 = await client.put("/config/logging", json={"level": "ERROR"})
+        assert resp3.status_code == 200
+        saved3 = await client.put("/config/yaml", json={"yaml_content": edited})
+        assert saved3.status_code == 200
+        assert "logging" not in saved3.json().get("preserved_keys", [])
+        # 旧快照 WARNING 覆盖了磁盘上的 ERROR（未提供基线时的既有语义）
+        assert "WARNING" in config_file.read_text(encoding="utf-8")

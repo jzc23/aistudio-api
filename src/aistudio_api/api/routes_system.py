@@ -400,6 +400,9 @@ async def force_next_account(
 
 class ConfigYamlUpdateRequest(BaseModel):
     yaml_content: str
+    # 编辑器页面加载时的基线快照：供服务端对共享编辑权的配置段（如 logging）
+    # 做三方合并，区分"用户未改动（保留磁盘外部修改）"与"用户主动编辑（尊重提交值）"。
+    base_yaml_content: str | None = None
 
 
 class FeaturesUpdateRequest(BaseModel):
@@ -455,16 +458,26 @@ async def update_features(req: FeaturesUpdateRequest) -> dict[str, object]:
 
 # 由专用管理接口独占的顶层配置键：YAML 编辑器快照保存时不得覆盖其磁盘值。
 _EDITOR_PROTECTED_KEYS: tuple[str, ...] = ("api_keys",)
+# 编辑器与其他管理入口（如日志设置卡片）共享编辑权的顶层配置键：
+# 依据"页面加载基线"做三方合并——快照未改动时保留磁盘外部修改，
+# 快照被用户主动改动时尊重提交值。
+_EDITOR_THREE_WAY_KEYS: tuple[str, ...] = ("logging",)
 
 
 def _merge_protected_config_keys(
-    incoming_text: str, incoming: dict[str, object]
+    incoming_text: str,
+    incoming: dict[str, object],
+    base: dict[str, object] | None = None,
 ) -> tuple[str, list[str]]:
     """YAML 编辑器保存前合并受保护配置段，防止旧快照覆盖并发修改。
 
     编辑器持有的是页面加载时的整份快照；若保存时磁盘上的受保护键
     （如通过 API Key 管理入口新增的 api_keys）已与快照不一致，则以磁盘
     当前值为准拼回写入内容，其余文本（含注释与排版）原样保留。
+
+    三方键（logging）在提供页面加载基线 ``base`` 时按三方合并决策：
+    提交值等于基线（用户未在编辑器改动）则保留磁盘外部修改；提交值偏离
+    基线（用户主动编辑）则尊重提交值。未提供基线时保持旧行为不保护。
     返回 (合并后文本, 实际保护的键列表)。
     """
     config_path = _resolve_config_path(None)
@@ -475,10 +488,21 @@ def _merge_protected_config_keys(
             if isinstance(loaded, dict):
                 current = loaded
 
+    preserve_keys: dict[str, bool] = {}
+    for key in _EDITOR_PROTECTED_KEYS:
+        preserve_keys[key] = current.get(key) != incoming.get(key)
+    for key in _EDITOR_THREE_WAY_KEYS:
+        if base is None:
+            continue
+        if incoming.get(key) != base.get(key):
+            continue
+        if current.get(key) != incoming.get(key):
+            preserve_keys[key] = True
+
     preserved: list[str] = []
     text = incoming_text
-    for key in _EDITOR_PROTECTED_KEYS:
-        if current.get(key) == incoming.get(key):
+    for key, should_preserve in preserve_keys.items():
+        if not should_preserve:
             continue
         block = (
             ""
@@ -513,10 +537,18 @@ async def update_config_yaml(req: ConfigYamlUpdateRequest) -> dict[str, object]:
             raise HTTPException(400, detail="YAML 顶层必须为字典结构")
     except yaml.YAMLError as e:
         raise HTTPException(400, detail=f"YAML 语法格式错误: {e}") from e
+    base_parsed: dict[str, object] | None = None
+    if req.base_yaml_content is not None:
+        with contextlib.suppress(yaml.YAMLError):
+            loaded_base = yaml.safe_load(req.base_yaml_content)
+            if isinstance(loaded_base, dict):
+                base_parsed = loaded_base
     config_yaml_path = _resolve_config_path(None)
     try:
         content_to_write, preserved_keys = _merge_protected_config_keys(
-            req.yaml_content, parsed if isinstance(parsed, dict) else {}
+            req.yaml_content,
+            parsed if isinstance(parsed, dict) else {},
+            base=base_parsed,
         )
         if preserved_keys:
             # 受保护键存在差异：以合并后的最终内容重解析，

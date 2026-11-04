@@ -345,8 +345,14 @@ async function handleSave() {
 
   saving.value = true
   try {
-    await systemApi.updateConfigYaml(contentToSave)
-    toast.success('系统与模型配置已成功保存并完成热重载！')
+    // 携带页面加载时的基线快照，供服务端对共享编辑权配置段（如 logging）
+    // 做三方合并：避免旧快照覆盖期间通过日志卡片等入口产生的修改。
+    const resp = await systemApi.updateConfigYaml(contentToSave, props.initialYaml)
+    if (resp?.preserved_keys?.length) {
+      toast.info(resp.message || '配置已保存（部分外部修改已自动保留）')
+    } else {
+      toast.success('系统与模型配置已成功保存并完成热重载！')
+    }
     emit('saved')
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : '保存配置失败'
