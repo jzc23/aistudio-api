@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import contextlib
-import re
 from datetime import date, datetime, timedelta
 from typing import TYPE_CHECKING
 
@@ -464,11 +463,55 @@ _EDITOR_PROTECTED_KEYS: tuple[str, ...] = ("api_keys",)
 _EDITOR_THREE_WAY_KEYS: tuple[str, ...] = ("logging",)
 
 
+def _splice_top_level_block(text: str, key: str, block_text: str) -> str:
+    """将 text 中指定顶层键的整个块替换为 block_text，其余内容原样保留。
+
+    逐行扫描识别块的完整边界：顶层键行 + 其后所有缩进行、空行与
+    零缩进 "- " 序列项行，直至下一个顶层映射键行。相较正则方案，
+    可正确覆盖块序列（如 api_keys 的列表项）并保证拼接处换行完整。
+    block_text 为空表示删除该块。
+    """
+    lines = text.splitlines(keepends=True)
+    out: list[str] = []
+    i = 0
+    replaced = False
+    key_prefix = f"{key}:"
+    while i < len(lines):
+        body = lines[i].rstrip("\r\n")
+        is_key_line = not body[:1].isspace() and (
+            body == key_prefix or body.startswith(key_prefix + " ")
+        )
+        if not replaced and is_key_line:
+            j = i + 1
+            while j < len(lines):
+                nxt = lines[j].rstrip("\r\n")
+                if not nxt or nxt.startswith((" ", "\t", "- ")):
+                    j += 1
+                    continue
+                break
+            if block_text:
+                out.append(
+                    block_text if block_text.endswith("\n") else f"{block_text}\n"
+                )
+            replaced = True
+            i = j
+            continue
+        out.append(lines[i])
+        i += 1
+    if not replaced and block_text:
+        if out and not out[-1].endswith("\n"):
+            out[-1] += "\n"
+        if out:
+            out.append("\n")
+        out.append(block_text if block_text.endswith("\n") else f"{block_text}\n")
+    return "".join(out)
+
+
 def _merge_protected_config_keys(
     incoming_text: str,
     incoming: dict[str, object],
     base: dict[str, object] | None = None,
-) -> tuple[str, list[str]]:
+) -> tuple[str, list[str], dict[str, object]]:
     """YAML 编辑器保存前合并受保护配置段，防止旧快照覆盖并发修改。
 
     编辑器持有的是页面加载时的整份快照；若保存时磁盘上的受保护键
@@ -478,7 +521,7 @@ def _merge_protected_config_keys(
     三方键（logging）在提供页面加载基线 ``base`` 时按三方合并决策：
     提交值等于基线（用户未在编辑器改动）则保留磁盘外部修改；提交值偏离
     基线（用户主动编辑）则尊重提交值。未提供基线时保持旧行为不保护。
-    返回 (合并后文本, 实际保护的键列表)。
+    返回 (合并后文本, 实际保护的键列表, 被保留的磁盘值)。
     """
     config_path = _resolve_config_path(None)
     current: dict[str, object] = {}
@@ -500,6 +543,7 @@ def _merge_protected_config_keys(
             preserve_keys[key] = True
 
     preserved: list[str] = []
+    protected_values: dict[str, object] = {}
     text = incoming_text
     for key, should_preserve in preserve_keys.items():
         if not should_preserve:
@@ -514,17 +558,10 @@ def _merge_protected_config_keys(
                 default_flow_style=False,
             ).rstrip("\n")
         )
-        # 替换快照中该顶层键的整个块：顶层键行起，至下一个顶级行或文末。
-        pattern = re.compile(rf"(?ms)^{re.escape(key)}:.*?(?=^\S|\Z)")
-        if pattern.search(text):
-            text = pattern.sub(block, text, count=1)
-            if not block:
-                text = text.lstrip("\n")
-        elif block:
-            stripped = text.rstrip()
-            text = f"{stripped}\n\n{block}\n" if stripped else f"{block}\n"
+        text = _splice_top_level_block(text, key, block)
+        protected_values[key] = current.get(key)
         preserved.append(key)
-    return text, preserved
+    return text, preserved, protected_values
 
 
 @protected_router.put("/config/yaml")
@@ -545,18 +582,33 @@ async def update_config_yaml(req: ConfigYamlUpdateRequest) -> dict[str, object]:
                 base_parsed = loaded_base
     config_yaml_path = _resolve_config_path(None)
     try:
-        content_to_write, preserved_keys = _merge_protected_config_keys(
+        (
+            content_to_write,
+            preserved_keys,
+            protected_values,
+        ) = _merge_protected_config_keys(
             req.yaml_content,
             parsed if isinstance(parsed, dict) else {},
             base=base_parsed,
         )
         if preserved_keys:
-            # 受保护键存在差异：以合并后的最终内容重解析，
-            # 保证后续热重载逻辑基于真实落盘的配置。
-            with contextlib.suppress(yaml.YAMLError):
+            # 硬校验：合并结果必须可解析；失败则退化为结构化重写
+            # （牺牲注释，但保证配置文件永远合法，杜绝坏档导致启动崩溃）。
+            try:
                 reparsed = yaml.safe_load(content_to_write)
-                if isinstance(reparsed, dict):
-                    parsed = reparsed
+            except yaml.YAMLError:
+                logger.warning(
+                    "配置段合并结果解析失败，回退为结构化重写 (保留: %s)",
+                    preserved_keys,
+                )
+                merged = dict(parsed) if isinstance(parsed, dict) else {}
+                merged.update(protected_values)
+                content_to_write = yaml.dump(
+                    merged, allow_unicode=True, sort_keys=False
+                )
+                reparsed = yaml.safe_load(content_to_write)
+            if isinstance(reparsed, dict):
+                parsed = reparsed
             logger.info(
                 "YAML 编辑器保存时自动保留了外部修改的配置段: %s", preserved_keys
             )

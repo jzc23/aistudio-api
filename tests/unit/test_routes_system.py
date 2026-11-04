@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import httpx
 import pytest
+import yaml
 
 from aistudio_api.api.app import app
 
@@ -280,3 +281,83 @@ async def test_config_yaml_save_three_way_logging_merge(monkeypatch, tmp_path):
         assert "logging" not in saved3.json().get("preserved_keys", [])
         # 旧快照 WARNING 覆盖了磁盘上的 ERROR（未提供基线时的既有语义）
         assert "WARNING" in config_file.read_text(encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_config_yaml_save_replaces_stale_api_keys_block_cleanly(
+    monkeypatch, tmp_path
+):
+    """替换路径回归：快照携带旧 api_keys 块时，落盘文件必须合法且保留磁盘新值。
+
+    该场景曾因正则块边界识别缺陷产出粘行的非法 YAML 导致容器启动崩溃。
+    """
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        "logging:\n  level: INFO\napi_keys:\n- name: old\n  key: sk-old\n"
+        "  created_at: '2026-01-01 00:00:00'\nmodel_defaults:\n  models: {}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AISTUDIO_CONFIG_FILE", str(config_file))
+    from aistudio_api.infrastructure.gateway.model_defaults import (
+        invalidate_config_cache,
+    )
+
+    invalidate_config_cache()
+    stale_snapshot = config_file.read_text(encoding="utf-8")
+
+    async with _client() as client:
+        # 外部新增一个 Key（磁盘值变为 old + new）
+        created = await client.post(
+            "/api-keys", json={"name": "new", "key": "sk-new-002"}
+        )
+        assert created.status_code == 200
+
+        # 编辑器旧快照（只含 old）保存 → 触发块替换路径
+        saved = await client.put("/config/yaml", json={"yaml_content": stale_snapshot})
+        assert saved.status_code == 200
+        assert "api_keys" in saved.json()["preserved_keys"]
+
+    final_text = config_file.read_text(encoding="utf-8")
+    # 落盘文件必须可完整解析（曾在此处产出非法 YAML）
+    final_doc = yaml.safe_load(final_text)
+    assert isinstance(final_doc, dict)
+    keys = {item["key"] for item in final_doc["api_keys"]}
+    assert keys == {"sk-old", "sk-new-002"}
+    # 其他段落不受影响
+    assert final_doc["logging"]["level"] == "INFO"
+    assert isinstance(final_doc["model_defaults"], dict)
+    # 无粘行：每个键独占一行
+    assert "created_at: '2026'- name" not in final_text
+
+
+@pytest.mark.asyncio
+async def test_config_yaml_save_logging_preserve_keeps_file_parseable(
+    monkeypatch, tmp_path
+):
+    """三方合并保留 logging 后，落盘文件必须可解析且等级为磁盘值。"""
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        "logging:\n  level: INFO\nmodel_defaults:\n  models: {}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AISTUDIO_CONFIG_FILE", str(config_file))
+    from aistudio_api.infrastructure.gateway.model_defaults import (
+        invalidate_config_cache,
+    )
+
+    invalidate_config_cache()
+    baseline = config_file.read_text(encoding="utf-8")
+
+    async with _client() as client:
+        await client.put("/config/logging", json={"level": "DEBUG"})
+        saved = await client.put(
+            "/config/yaml",
+            json={"yaml_content": baseline, "base_yaml_content": baseline},
+        )
+        assert saved.status_code == 200
+
+    final_doc = yaml.safe_load(config_file.read_text(encoding="utf-8"))
+    assert isinstance(final_doc, dict)
+    assert final_doc["logging"]["level"] == "DEBUG"
+    assert isinstance(final_doc["model_defaults"], dict)
+    assert "DEBUGmodel_defaults" not in config_file.read_text(encoding="utf-8")
