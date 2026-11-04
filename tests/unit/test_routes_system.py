@@ -190,3 +190,43 @@ async def test_system_resources_endpoint(monkeypatch):
     assert "cpu_percent" in payload
     assert "memory_mb" in payload
     assert "instances" in payload
+
+
+@pytest.mark.asyncio
+async def test_config_yaml_save_preserves_concurrent_api_keys(monkeypatch, tmp_path):
+    """编辑器旧快照保存不得覆盖期间新增的 API Key（回归测试）。"""
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        """# 测试配置
+logging:
+  level: INFO
+model_defaults:
+  models: {}
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AISTUDIO_CONFIG_FILE", str(config_file))
+    from aistudio_api.infrastructure.gateway.model_defaults import (
+        invalidate_config_cache,
+    )
+
+    invalidate_config_cache()
+
+    async with _client() as client:
+        created = await client.post(
+            "/api-keys", json={"name": "persist-key", "key": "sk-test-fixed-001"}
+        )
+        assert created.status_code == 200
+
+        # 模拟编辑器的旧快照：内容里完全没有 api_keys 段
+        stale_snapshot = config_file.read_text(encoding="utf-8").split("api_keys:")[0]
+        saved = await client.put("/config/yaml", json={"yaml_content": stale_snapshot})
+        assert saved.status_code == 200
+        assert "api_keys" in saved.json().get("preserved_keys", [])
+
+        keys = await client.get("/api-keys")
+        assert keys.status_code == 200
+        items = keys.json()
+        assert any(item["key"] == "sk-test-fixed-001" for item in items)
+
+    assert "sk-test-fixed-001" in config_file.read_text(encoding="utf-8")

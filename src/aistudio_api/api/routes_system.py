@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import re
 from datetime import date, datetime, timedelta
 from typing import TYPE_CHECKING
 
@@ -452,6 +453,56 @@ async def update_features(req: FeaturesUpdateRequest) -> dict[str, object]:
     return {"ok": True, "features": features}
 
 
+# 由专用管理接口独占的顶层配置键：YAML 编辑器快照保存时不得覆盖其磁盘值。
+_EDITOR_PROTECTED_KEYS: tuple[str, ...] = ("api_keys",)
+
+
+def _merge_protected_config_keys(
+    incoming_text: str, incoming: dict[str, object]
+) -> tuple[str, list[str]]:
+    """YAML 编辑器保存前合并受保护配置段，防止旧快照覆盖并发修改。
+
+    编辑器持有的是页面加载时的整份快照；若保存时磁盘上的受保护键
+    （如通过 API Key 管理入口新增的 api_keys）已与快照不一致，则以磁盘
+    当前值为准拼回写入内容，其余文本（含注释与排版）原样保留。
+    返回 (合并后文本, 实际保护的键列表)。
+    """
+    config_path = _resolve_config_path(None)
+    current: dict[str, object] = {}
+    if config_path.exists():
+        with contextlib.suppress(Exception):
+            loaded = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                current = loaded
+
+    preserved: list[str] = []
+    text = incoming_text
+    for key in _EDITOR_PROTECTED_KEYS:
+        if current.get(key) == incoming.get(key):
+            continue
+        block = (
+            ""
+            if key not in current
+            else yaml.dump(
+                {key: current[key]},
+                allow_unicode=True,
+                sort_keys=False,
+                default_flow_style=False,
+            ).rstrip("\n")
+        )
+        # 替换快照中该顶层键的整个块：顶层键行起，至下一个顶级行或文末。
+        pattern = re.compile(rf"(?ms)^{re.escape(key)}:.*?(?=^\S|\Z)")
+        if pattern.search(text):
+            text = pattern.sub(block, text, count=1)
+            if not block:
+                text = text.lstrip("\n")
+        elif block:
+            stripped = text.rstrip()
+            text = f"{stripped}\n\n{block}\n" if stripped else f"{block}\n"
+        preserved.append(key)
+    return text, preserved
+
+
 @protected_router.put("/config/yaml")
 async def update_config_yaml(req: ConfigYamlUpdateRequest) -> dict[str, object]:
     """更新 config.yaml 文件内容并热重载默认配置。"""
@@ -464,7 +515,20 @@ async def update_config_yaml(req: ConfigYamlUpdateRequest) -> dict[str, object]:
         raise HTTPException(400, detail=f"YAML 语法格式错误: {e}") from e
     config_yaml_path = _resolve_config_path(None)
     try:
-        config_yaml_path.write_text(req.yaml_content, encoding="utf-8")
+        content_to_write, preserved_keys = _merge_protected_config_keys(
+            req.yaml_content, parsed if isinstance(parsed, dict) else {}
+        )
+        if preserved_keys:
+            # 受保护键存在差异：以合并后的最终内容重解析，
+            # 保证后续热重载逻辑基于真实落盘的配置。
+            with contextlib.suppress(yaml.YAMLError):
+                reparsed = yaml.safe_load(content_to_write)
+                if isinstance(reparsed, dict):
+                    parsed = reparsed
+            logger.info(
+                "YAML 编辑器保存时自动保留了外部修改的配置段: %s", preserved_keys
+            )
+        config_yaml_path.write_text(content_to_write, encoding="utf-8")
         invalidate_config_cache()
 
         if isinstance(parsed, dict) and "logging" in parsed:
@@ -486,7 +550,10 @@ async def update_config_yaml(req: ConfigYamlUpdateRequest) -> dict[str, object]:
                 if "dump_dir" in raw_logging:
                     set_dump_dir(str(raw_logging["dump_dir"]))
         logger.info("配置文件 config.yaml 已更新并重新加载")
-        return {"ok": True, "message": "配置已保存并重载"}
+        message = "配置已保存并重载"
+        if preserved_keys:
+            message += f"（已自动保留期间外部修改的 {', '.join(preserved_keys)}）"
+        return {"ok": True, "message": message, "preserved_keys": preserved_keys}
     except Exception as e:
         raise HTTPException(500, detail=f"写入配置文件失败: {e}") from e
 
