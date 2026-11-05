@@ -1,0 +1,910 @@
+"""Application services for chat/image orchestration."""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from aistudio_api.api.schemas import GeminiGenerateContentRequest, GeminiTool
+
+from dataclasses import dataclass
+
+from aistudio_api.infrastructure.gateway.model_defaults import resolve_model_defaults
+from aistudio_api.infrastructure.gateway.wire_codec import build_tools_from_names
+from aistudio_api.infrastructure.gateway.wire_spec import JspbArray, SchemaIndex
+from aistudio_api.infrastructure.gateway.wire_types import (
+    AistudioContent,
+    AistudioImageOutputMode,
+    AistudioPart,
+    AistudioThinkingConfig,
+    ThinkingLevel,
+)
+
+
+@dataclass
+class NormalizedGeminiRequest:
+    model: str
+    contents: list[AistudioContent]
+    system_instruction: AistudioContent | None
+    tools: list[list[object]] | None
+    safety_settings: list[list[object]] | None
+    tool_config: list[object] | None = None
+    temperature: float | None = None
+    top_p: float | None = None
+    top_k: int | None = None
+    max_tokens: int | None = None
+    generation_config_overrides: dict[str, object] | None = None
+
+
+SCHEMA_TYPE_CODES = {
+    "string": 1,
+    "number": 2,
+    "float": 2,
+    "integer": 3,
+    "int": 3,
+    "boolean": 4,
+    "bool": 4,
+    "array": 5,
+    "object": 6,
+    "null": 7,
+}
+
+
+def _resolve_schema_type_code(schema: dict[str, object]) -> tuple[int, str, bool]:
+    raw_type = schema.get("type")
+    is_nullable = False
+    if isinstance(raw_type, list):
+        non_null_types = [t for t in raw_type if str(t).lower() != "null"]
+        if any(str(t).lower() == "null" for t in raw_type):
+            is_nullable = True
+        raw_type = non_null_types[0] if non_null_types else "string"
+    schema_type = str(raw_type or "").split(".")[-1].strip().lower()
+
+    if not schema_type or schema_type not in SCHEMA_TYPE_CODES or schema_type == "null":
+        if "properties" in schema:
+            schema_type = "object"
+        elif "items" in schema or "prefixItems" in schema or "prefix_items" in schema:
+            schema_type = "array"
+        elif "const" in schema:
+            cv = schema["const"]
+            if isinstance(cv, str):
+                schema_type = "string"
+            elif isinstance(cv, bool):
+                schema_type = "boolean"
+            elif isinstance(cv, int):
+                schema_type = "integer"
+            elif isinstance(cv, float):
+                schema_type = "number"
+            elif isinstance(cv, dict):
+                schema_type = "object"
+            elif isinstance(cv, list):
+                schema_type = "array"
+        elif (
+            "enum" in schema
+            and isinstance(schema["enum"], (list, tuple))
+            and schema["enum"]
+        ):
+            all_types = {type(x) for x in schema["enum"]}
+            if all_types == {str}:
+                schema_type = "string"
+            elif all_types == {bool}:
+                schema_type = "boolean"
+            elif all_types == {int}:
+                schema_type = "integer"
+            elif all_types <= {int, float}:
+                schema_type = "number"
+        elif any(
+            k in schema
+            for k in ("anyOf", "any_of", "oneOf", "one_of", "allOf", "all_of")
+        ):
+            combiner = (
+                schema.get("anyOf")
+                or schema.get("any_of")
+                or schema.get("oneOf")
+                or schema.get("one_of")
+                or schema.get("allOf")
+                or schema.get("all_of")
+            )
+            if isinstance(combiner, list) and combiner:
+                branch_types = [
+                    str(b.get("type") or "").split(".")[-1].strip().lower()
+                    for b in combiner
+                    if isinstance(b, dict) and b.get("type")
+                ]
+                if "object" in branch_types:
+                    schema_type = "object"
+                elif branch_types:
+                    schema_type = branch_types[0]
+                else:
+                    schema_type = "object"
+            else:
+                schema_type = "object"
+        else:
+            schema_type = "object"
+
+    type_code = SCHEMA_TYPE_CODES.get(schema_type, 6)
+    if type_code not in (1, 2, 3, 4, 5, 6):
+        type_code = 6
+    return type_code, schema_type, is_nullable
+
+
+def _encode_schema_combiners(
+    schema: dict[str, object], wire: JspbArray, include_required: bool
+) -> None:
+    one_of = schema.get("oneOf") or schema.get("one_of")
+    if isinstance(one_of, list) and one_of:
+        wire[SchemaIndex.ONE_OF] = [
+            encode_schema_to_wire(
+                sub if isinstance(sub, dict) else {},
+                include_required=include_required,
+            )
+            for sub in one_of
+            if isinstance(sub, dict) or sub is True
+        ]
+
+    any_of = schema.get("anyOf") or schema.get("any_of")
+    if isinstance(any_of, list) and any_of:
+        wire[SchemaIndex.ANY_OF] = [
+            encode_schema_to_wire(
+                sub if isinstance(sub, dict) else {},
+                include_required=include_required,
+            )
+            for sub in any_of
+            if isinstance(sub, dict) or sub is True
+        ]
+
+    all_of = schema.get("allOf") or schema.get("all_of")
+    if isinstance(all_of, list) and all_of:
+        wire[SchemaIndex.ALL_OF] = [
+            encode_schema_to_wire(
+                sub if isinstance(sub, dict) else {},
+                include_required=include_required,
+            )
+            for sub in all_of
+            if isinstance(sub, dict) or sub is True
+        ]
+
+    not_schema = schema.get("not") or schema.get("not_")
+    if isinstance(not_schema, dict):
+        wire[SchemaIndex.NOT] = encode_schema_to_wire(
+            not_schema, include_required=include_required
+        )
+
+
+def encode_schema_to_wire(
+    schema: dict[str, object], *, include_required: bool = True
+) -> list[object]:
+    type_code, schema_type, is_nullable = _resolve_schema_type_code(schema)
+    wire = JspbArray([type_code])
+
+    fmt = schema.get("format")
+    if isinstance(fmt, str) and fmt:
+        wire[SchemaIndex.FORMAT] = fmt
+
+    desc = schema.get("description")
+    if isinstance(desc, str) and desc:
+        wire[SchemaIndex.DESCRIPTION] = desc
+
+    nullable = schema.get("nullable")
+    if isinstance(nullable, bool):
+        wire[SchemaIndex.NULLABLE] = nullable
+    elif is_nullable:
+        wire[SchemaIndex.NULLABLE] = True
+
+    enum_vals = schema.get("enum")
+    if not enum_vals and "const" in schema:
+        enum_vals = [schema["const"]]
+    if isinstance(enum_vals, (list, tuple)) and enum_vals:
+        wire[SchemaIndex.ENUM] = [str(x) for x in enum_vals]
+
+    items = schema.get("items")
+    if schema_type == "array" or items is not None:
+        if isinstance(items, dict):
+            wire[SchemaIndex.ITEMS] = encode_schema_to_wire(
+                items,
+                include_required=include_required,
+            )
+        elif isinstance(items, list) and items and isinstance(items[0], dict):
+            wire[SchemaIndex.ITEMS] = encode_schema_to_wire(
+                items[0],
+                include_required=include_required,
+            )
+        elif items is True:
+            wire[SchemaIndex.ITEMS] = [6]
+
+    properties = schema.get("properties")
+    if isinstance(properties, dict):
+        wire[SchemaIndex.PROPERTIES] = [
+            [
+                name,
+                encode_schema_to_wire(
+                    prop if isinstance(prop, dict) else {},
+                    include_required=include_required,
+                ),
+            ]
+            for name, prop in properties.items()
+            if isinstance(prop, dict) or prop is True
+        ]
+
+    required = schema.get("required")
+    if include_required and isinstance(required, (list, tuple, set)):
+        wire[SchemaIndex.REQUIRED] = [str(x) for x in required]
+
+    min_props = schema.get("minProperties", schema.get("min_properties"))
+    if isinstance(min_props, int):
+        wire[SchemaIndex.MIN_PROPERTIES] = min_props
+
+    max_props = schema.get("maxProperties", schema.get("max_properties"))
+    if isinstance(max_props, int):
+        wire[SchemaIndex.MAX_PROPERTIES] = max_props
+
+    minimum = schema.get("minimum")
+    if isinstance(minimum, (int, float)) and not isinstance(minimum, bool):
+        wire[SchemaIndex.MINIMUM] = minimum
+
+    maximum = schema.get("maximum")
+    if isinstance(maximum, (int, float)) and not isinstance(maximum, bool):
+        wire[SchemaIndex.MAXIMUM] = maximum
+
+    min_len = schema.get("minLength", schema.get("min_length"))
+    if isinstance(min_len, int):
+        wire[SchemaIndex.MIN_LENGTH] = min_len
+
+    max_len = schema.get("maxLength", schema.get("max_length"))
+    if isinstance(max_len, int):
+        wire[SchemaIndex.MAX_LENGTH] = max_len
+
+    pattern = schema.get("pattern")
+    if isinstance(pattern, str) and pattern:
+        wire[SchemaIndex.PATTERN] = pattern
+
+    _encode_schema_combiners(schema, wire, include_required)
+
+    max_items = schema.get("maxItems", schema.get("max_items"))
+    if isinstance(max_items, int):
+        wire[SchemaIndex.MAX_ITEMS] = max_items
+
+    min_items = schema.get("minItems", schema.get("min_items"))
+    if isinstance(min_items, int):
+        wire[SchemaIndex.MIN_ITEMS] = min_items
+
+    property_ordering = schema.get("propertyOrdering") or schema.get(
+        "property_ordering"
+    )
+    if isinstance(property_ordering, list):
+        wire[SchemaIndex.PROPERTY_ORDERING] = list(property_ordering)
+
+    return wire.compact(max_index=SchemaIndex.PROPERTY_ORDERING)
+
+
+def encode_function_declaration_to_wire(declaration: dict[str, object]) -> list[object]:
+    if isinstance(declaration.get("function"), dict):
+        declaration = declaration["function"]  # type: ignore[assignment]
+    if not declaration.get("name"):
+        raise ValueError("functionDeclarations[].name is required")
+    wire = JspbArray([declaration["name"]])
+    if declaration.get("description") is not None:
+        wire[1] = declaration["description"]
+
+    parameters = (
+        declaration.get("parameters")
+        or declaration.get("parametersJsonSchema")
+        or declaration.get("parameters_json_schema")
+        or declaration.get("input_schema")
+        or declaration.get("parameters_schema")
+    )
+    if isinstance(parameters, dict):
+        wire[2] = encode_schema_to_wire(parameters, include_required=True)
+    elif isinstance(parameters, list):
+        wire[2] = parameters
+
+    return wire.compact()
+
+
+def _normalize_gemini_modalities(
+    value: object, *, drop_unsupported: bool = True
+) -> AistudioImageOutputMode | None:
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        if drop_unsupported:
+            return None
+        raise ValueError("generationConfig.responseModalities must be a list")
+
+    modalities = {str(item).strip().upper() for item in value if str(item).strip()}
+    if not modalities:
+        return None
+    unknown = modalities - {"TEXT", "IMAGE"}
+    if unknown:
+        if not drop_unsupported:
+            raise ValueError(
+                f"Unsupported response modalities: {', '.join(sorted(unknown))}"
+            )
+        modalities = modalities & {"TEXT", "IMAGE"}
+        if not modalities:
+            return None
+    if "IMAGE" not in modalities:
+        return None
+    if "TEXT" in modalities:
+        return AistudioImageOutputMode.text_and_image()
+    return AistudioImageOutputMode.image_only()
+
+
+_REASONING_EFFORT_TO_LEVEL: dict[str, ThinkingLevel] = {
+    "MINIMAL": ThinkingLevel.MINIMAL,
+    "LOW": ThinkingLevel.LOW,
+    "MEDIUM": ThinkingLevel.MEDIUM,
+    "HIGH": ThinkingLevel.HIGH,
+}
+
+
+def _parse_thinking_level(raw_level: object) -> ThinkingLevel | None:
+    if raw_level is None:
+        return None
+    if isinstance(raw_level, ThinkingLevel):
+        return raw_level
+    if isinstance(raw_level, int) and not isinstance(raw_level, bool):
+        return ThinkingLevel(raw_level)
+    label = str(raw_level).strip().upper()
+    if not label or label in ("NONE", "OFF", "DISABLE", "DISABLED", "0"):
+        return None
+    if label in _REASONING_EFFORT_TO_LEVEL:
+        return _REASONING_EFFORT_TO_LEVEL[label]
+    return ThinkingLevel[label]
+
+
+def _normalize_gemini_thinking_config(
+    value: object,
+) -> list[object] | None:
+    if value is None or isinstance(value, list):
+        return value
+    if not isinstance(value, dict):
+        raise ValueError(
+            "generationConfig.thinkingConfig must be an object or wire array"
+        )
+
+    raw_level = value.get(
+        "thinkingLevel", value.get("thinking_level", value.get("level"))
+    )
+    raw_budget = value.get(
+        "thinkingBudget", value.get("thinking_budget", value.get("budget"))
+    )
+    raw_mode = value.get("mode")
+    raw_include = value.get("includeThoughts", value.get("include_thoughts"))
+
+    if isinstance(raw_level, str) and raw_level.strip().upper() in (
+        "NONE",
+        "OFF",
+        "DISABLE",
+        "DISABLED",
+    ):
+        return None
+    if (
+        raw_include is False
+        and raw_level is None
+        and raw_budget is None
+        and raw_mode is None
+    ):
+        return None
+
+    level = _parse_thinking_level(raw_level)
+    budget: int | None = None
+    if raw_budget is not None and not isinstance(raw_budget, bool):
+        budget = int(str(raw_budget))
+        if budget == 0 and level is None and raw_mode is None:
+            return None
+
+    if level is None and budget is None and raw_mode is None:
+        return None
+
+    mode = (
+        int(str(raw_mode))
+        if raw_mode is not None and not isinstance(raw_mode, bool)
+        else 1
+    )
+    return AistudioThinkingConfig(level=level, mode=mode, budget=budget).to_wire()
+
+
+def _normalize_gemini_image_config(
+    value: object, *, drop_unsupported: bool = True
+) -> dict[str, object]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        if drop_unsupported:
+            return {}
+        raise ValueError("generationConfig.imageConfig must be an object")
+
+    aspect_ratio = value.get("aspectRatio")
+    image_size = value.get("imageSize")
+    if isinstance(aspect_ratio, str) and not aspect_ratio.strip():
+        aspect_ratio = None
+    if isinstance(image_size, str):
+        image_size = image_size.strip() or None
+    person_generation = value.get("personGeneration")
+    if person_generation not in (None, "") and not drop_unsupported:
+        raise ValueError(
+            "generationConfig.imageConfig.personGeneration is not supported yet"
+        )
+
+    normalized: dict[str, object] = {}
+    if aspect_ratio is not None or image_size is not None:
+        normalized["output_resolution"] = [aspect_ratio, image_size]
+    return normalized
+
+
+def _normalize_gemini_tool_config(value: object) -> list[object] | None:
+    if value is None:
+        return None
+    if isinstance(value, list):
+        return value
+    model_dump_fn = getattr(value, "model_dump", None)
+    if callable(model_dump_fn):
+        value = model_dump_fn(mode="json", exclude_none=True)
+    if not isinstance(value, dict):
+        return None
+
+    fcc = value.get("functionCallingConfig") or value.get("function_calling_config")
+    if not isinstance(fcc, dict):
+        return None
+
+    mode_map = {
+        "MODE_UNSPECIFIED": 0,
+        "AUTO": 1,
+        "ANY": 2,
+        "NONE": 3,
+        "VALIDATED": 4,
+    }
+    raw_mode = fcc.get("mode", "AUTO")
+    if isinstance(raw_mode, int):
+        mode_code = raw_mode
+    else:
+        mode_code = mode_map.get(str(raw_mode).strip().upper(), 1)
+
+    allowed_names = fcc.get("allowedFunctionNames") or fcc.get("allowed_function_names")
+    fcc_wire: list[object] = [mode_code]
+    if isinstance(allowed_names, list) and allowed_names:
+        fcc_wire.append(list(allowed_names))
+
+    include_invocations = value.get("includeServerSideToolInvocations") or value.get(
+        "include_server_side_tool_invocations"
+    )
+    tool_config_wire: list[object] = [None, fcc_wire]
+    if include_invocations is not None:
+        tool_config_wire.append(bool(include_invocations))
+    return tool_config_wire
+
+
+def _extract_google_search_tool_names(
+    tool: GeminiTool, *, is_image_model: bool
+) -> list[str]:
+    if tool.googleSearchRetrieval is not None:
+        return ["google_search"]
+
+    config = tool.googleSearch
+    if config is None:
+        return []
+    if not is_image_model or not isinstance(config, dict):
+        return ["google_search"]
+
+    search_types = config.get("searchTypes")
+    if not isinstance(search_types, dict):
+        return ["google_search"]
+
+    web_enabled = search_types.get("webSearch") is not None
+    image_enabled = search_types.get("imageSearch") is not None
+    if web_enabled and image_enabled:
+        return ["google_search_and_image_search"]
+    if image_enabled:
+        return ["image_search"]
+    return ["google_search"]
+
+
+def _filter_default_tools_for_model(
+    tool_names: tuple[str, ...], *, is_image_model: bool
+) -> list[str]:
+    names = [str(name).strip() for name in tool_names if str(name).strip()]
+    if not is_image_model:
+        return names
+    allowed = {"google_search", "image_search", "google_search_and_image_search"}
+    return [name for name in names if name in allowed]
+
+
+# 内置搜索工具的覆盖关系：复合工具覆盖其组成部分，去重时据此跳过被覆盖的窄工具。
+_BUILTIN_TOOL_COVERS = {
+    "google_search_and_image_search": ("google_search", "image_search"),
+}
+
+
+def _drop_covered_builtin_tools(names: list[str], seen: set[str]) -> list[str]:
+    """从 names 去掉已被 ``seen`` 覆盖或被同批 names 覆盖的内置工具。
+
+    例如 seen 含 google_search_and_image_search 时，google_search 被视为冗余跳过；
+    同一批 names 里两者并存时也只保留复合工具。
+    """
+    have: set[str] = set(seen)
+    result: list[str] = []
+    for name in names:
+        if name in have:
+            continue
+        if any(
+            name in subs and sup in have for sup, subs in _BUILTIN_TOOL_COVERS.items()
+        ):
+            continue
+        result.append(name)
+        have.add(name)
+    return result
+
+
+_GEMINI_SAFETY_CATEGORY_MAP = {
+    "HARM_CATEGORY_HARASSMENT": 7,
+    "HARM_CATEGORY_HATE_SPEECH": 8,
+    "HARM_CATEGORY_SEXUALLY_EXPLICIT": 9,
+    "HARM_CATEGORY_DANGEROUS_CONTENT": 10,
+}
+
+_GEMINI_SAFETY_THRESHOLD_MAP = {
+    "BLOCK_LOW_AND_ABOVE": 1,
+    "BLOCK_MEDIUM_AND_ABOVE": 2,
+    "BLOCK_ONLY_HIGH": 3,
+    "BLOCK_NONE": 4,
+    "OFF": 5,
+}
+
+
+def _normalize_gemini_safety_settings(
+    value: object, *, drop_unsupported: bool = True
+) -> list[list[object]]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        if drop_unsupported:
+            return []
+        raise ValueError("safetySettings must be a list")
+
+    normalized: list[list[object]] = []
+    for item in value:
+        raw_cat = (
+            getattr(item, "category", None)
+            if hasattr(item, "category")
+            else (item.get("category") if isinstance(item, dict) else None)
+        )
+        raw_thresh = (
+            getattr(item, "threshold", None)
+            if hasattr(item, "threshold")
+            else (item.get("threshold") if isinstance(item, dict) else None)
+        )
+
+        if raw_cat is None or raw_thresh is None:
+            if drop_unsupported:
+                continue
+            raise ValueError(f"Unsupported safety setting entry: {item!r}")
+
+        category = _GEMINI_SAFETY_CATEGORY_MAP.get(str(raw_cat).strip().upper())
+        if category is None:
+            if drop_unsupported:
+                continue
+            raise ValueError(f"Unsupported safety category: {raw_cat}")
+        threshold = _GEMINI_SAFETY_THRESHOLD_MAP.get(str(raw_thresh).strip().upper())
+        if threshold is None:
+            if drop_unsupported:
+                continue
+            raise ValueError(f"Unsupported safety threshold: {raw_thresh}")
+        normalized.append([None, None, category, threshold])
+    return normalized
+
+
+def normalize_gemini_request(
+    req: GeminiGenerateContentRequest, requested_model: str
+) -> NormalizedGeminiRequest:
+    if not req.contents:
+        raise ValueError("contents is required")
+
+    model = (
+        requested_model
+        if requested_model.startswith("models/")
+        else f"models/{requested_model}"
+    )
+    contents: list[AistudioContent] = []
+
+    for content in req.contents:
+        role = content.role or "user"
+        parts: list[AistudioPart] = []
+        for part in content.parts:
+            if part.text is not None:
+                is_thought = bool(part.thought)
+                parts.append(
+                    AistudioPart(
+                        text=part.text,
+                        thought=is_thought,
+                        thought_signature=part.thoughtSignature,
+                    )
+                )
+                continue
+            if part.inlineData is not None:
+                img_data = (part.inlineData.mimeType, part.inlineData.data)
+                parts.append(
+                    AistudioPart(
+                        inline_data=img_data,
+                        thought_signature=part.thoughtSignature,
+                    )
+                )
+                continue
+            if part.functionCall is not None:
+                fc = part.functionCall
+                args_payload = fc.args if fc.args is not None else {}
+                parts.append(
+                    AistudioPart(
+                        function_call=(fc.name, args_payload, fc.id)
+                        if fc.id
+                        else (fc.name, args_payload),
+                        thought_signature=part.thoughtSignature,
+                    )
+                )
+                continue
+            if part.functionResponse is not None:
+                fr = part.functionResponse
+                resp_payload = fr.response if fr.response is not None else {}
+                parts.append(
+                    AistudioPart(
+                        function_response=(fr.name, resp_payload, fr.id)
+                        if fr.id
+                        else (fr.name, resp_payload),
+                    )
+                )
+                if fr.parts:
+                    for subpart in fr.parts:
+                        if subpart.inlineData is not None:
+                            img_data = (
+                                subpart.inlineData.mimeType,
+                                subpart.inlineData.data,
+                            )
+                            parts.append(
+                                AistudioPart(
+                                    inline_data=img_data,
+                                    thought_signature=subpart.thoughtSignature,
+                                )
+                            )
+                        elif subpart.text is not None:
+                            parts.append(AistudioPart(text=subpart.text))
+                continue
+            if part.executableCode is not None:
+                ec = part.executableCode
+                parts.append(
+                    AistudioPart(
+                        executable_code=(ec.language, ec.code),
+                        thought_signature=part.thoughtSignature,
+                    )
+                )
+                continue
+            if part.codeExecutionResult is not None:
+                cer = part.codeExecutionResult
+                parts.append(
+                    AistudioPart(
+                        code_execution_result=(cer.outcome, cer.output),
+                        thought_signature=part.thoughtSignature,
+                    )
+                )
+                continue
+            if part.fileData is not None:
+                raise ValueError("fileData is not supported yet")
+        contents.append(AistudioContent(role=role, parts=parts))
+    system_instruction = None
+    if req.systemInstruction is not None:
+        system_instruction = AistudioContent(
+            role=req.systemInstruction.role or "user",
+            parts=[
+                AistudioPart(
+                    text=part.text,
+                    thought_signature=part.thoughtSignature,
+                )
+                if part.text is not None
+                else AistudioPart(
+                    inline_data=(part.inlineData.mimeType, part.inlineData.data)
+                    if part.inlineData
+                    else ("", ""),
+                    thought_signature=part.thoughtSignature,
+                )
+                for part in req.systemInstruction.parts
+                if part.text is not None or part.inlineData is not None
+            ],
+        )
+
+    model_defaults = resolve_model_defaults(model)
+    tools = None
+    seen_builtin: set[str] = set()
+    if req.tools is not None:
+        tools = []
+        all_function_declarations: list[list[object]] = []
+        for tool in req.tools:
+            builtin_tool_names: list[str] = []
+            if tool.codeExecution is not None:
+                builtin_tool_names.append("code_execution")
+            if tool.functionDeclarations:
+                for decl in tool.functionDeclarations:
+                    if isinstance(decl, dict):
+                        all_function_declarations.append(
+                            encode_function_declaration_to_wire(decl)
+                        )
+            builtin_tool_names.extend(
+                _extract_google_search_tool_names(
+                    tool, is_image_model=model_defaults.is_image_model
+                )
+            )
+            if tool.googleMaps is not None:
+                builtin_tool_names.append("google_maps")
+            if tool.urlContext is not None:
+                builtin_tool_names.append("url_context")
+            if builtin_tool_names:
+                filtered_builtin = _drop_covered_builtin_tools(
+                    builtin_tool_names, seen_builtin
+                )
+                if filtered_builtin:
+                    tools.extend(
+                        build_tools_from_names(
+                            filtered_builtin,
+                            model=model,
+                            is_image_model=model_defaults.is_image_model,
+                            drop_unsupported=model_defaults.drop_unsupported_params,
+                        )
+                    )
+                    seen_builtin.update(filtered_builtin)
+        if all_function_declarations:
+            tools.append([None, all_function_declarations])
+
+    # 仅当客户端未传 tools 时注入 config.yaml 的 default_tools。
+    # 若客户端显式声明了 tools（如自定义函数声明），绝不自动混入 Google Search 等内置工具，
+    # 避免触发 Google MakerSuite "Please enable tool_config.include_server_side_tool_invocations" 400 报错。
+    if req.tools is None and model_defaults.default_tools:
+        default_tool_names = _filter_default_tools_for_model(
+            model_defaults.default_tools,
+            is_image_model=model_defaults.is_image_model,
+        )
+        injected = (
+            build_tools_from_names(
+                default_tool_names,
+                model=model,
+                is_image_model=model_defaults.is_image_model,
+            )
+            if default_tool_names
+            else []
+        )
+        tools = injected if injected else None
+
+    raw_tool_config = getattr(req, "toolConfig", None)
+    tool_config = _normalize_gemini_tool_config(raw_tool_config)
+
+    # 检查工具调用模式。若为 NONE，显式置空 tools 与 tool_config，确保模型仅输出纯文本且不调用任何工具。
+    is_mode_none = False
+    if isinstance(raw_tool_config, dict):
+        fcc = raw_tool_config.get("functionCallingConfig") or raw_tool_config.get(
+            "function_calling_config"
+        )
+        if isinstance(fcc, dict):
+            m_val = fcc.get("mode")
+            if m_val in (3, "NONE", "none"):
+                is_mode_none = True
+    elif (
+        isinstance(tool_config, list)
+        and len(tool_config) > 1
+        and isinstance(tool_config[1], list)
+    ):
+        if tool_config[1] and tool_config[1][0] == 3:
+            is_mode_none = True
+
+    if is_mode_none:
+        tools = None
+        tool_config = None
+    generation_config = req.generationConfig
+    generation_config_overrides = {
+        key: value
+        for key, value in model_defaults.generation_config_overrides().items()
+        if value is not None
+    } or None
+    if generation_config is not None:
+        if generation_config_overrides is None:
+            generation_config_overrides = {}
+        if generation_config.stopSequences is not None:
+            generation_config_overrides["stop_sequences"] = (
+                generation_config.stopSequences
+            )
+        if generation_config.maxOutputTokens is not None:
+            generation_config_overrides["max_tokens"] = (
+                generation_config.maxOutputTokens
+            )
+        if generation_config.temperature is not None:
+            generation_config_overrides["temperature"] = generation_config.temperature
+        if generation_config.topP is not None:
+            generation_config_overrides["top_p"] = generation_config.topP
+        if generation_config.topK is not None:
+            generation_config_overrides["top_k"] = generation_config.topK
+        if generation_config.responseMimeType is not None:
+            generation_config_overrides["response_mime_type"] = (
+                generation_config.responseMimeType
+            )
+        if generation_config.responseSchema is not None:
+            generation_config_overrides["response_schema"] = (
+                encode_schema_to_wire(generation_config.responseSchema)
+                if isinstance(generation_config.responseSchema, dict)
+                else generation_config.responseSchema
+            )
+        if generation_config.presencePenalty is not None:
+            generation_config_overrides["presence_penalty"] = (
+                generation_config.presencePenalty
+            )
+        if generation_config.frequencyPenalty is not None:
+            generation_config_overrides["frequency_penalty"] = (
+                generation_config.frequencyPenalty
+            )
+        if generation_config.responseLogprobs is not None:
+            generation_config_overrides["response_logprobs"] = (
+                generation_config.responseLogprobs
+            )
+        if generation_config.logprobs is not None:
+            generation_config_overrides["logprobs"] = generation_config.logprobs
+        if generation_config.seed is not None:
+            generation_config_overrides["seed"] = generation_config.seed
+        if generation_config.mediaResolution is not None:
+            generation_config_overrides["media_resolution"] = (
+                generation_config.mediaResolution
+            )
+        if generation_config.thinkingConfig is not None:
+            normalized_thinking = _normalize_gemini_thinking_config(
+                generation_config.thinkingConfig
+            )
+            if normalized_thinking is not None:
+                generation_config_overrides["thinking_config"] = normalized_thinking
+            elif "thinking_config" in generation_config_overrides:
+                generation_config_overrides["thinking_config"] = None
+        if generation_config.responseModalities is not None:
+            image_output_mode = _normalize_gemini_modalities(
+                generation_config.responseModalities,
+                drop_unsupported=model_defaults.drop_unsupported_params,
+            )
+            if image_output_mode is not None:
+                generation_config_overrides["image_output_mode"] = image_output_mode
+        if generation_config.imageConfig is not None:
+            generation_config_overrides.update(
+                _normalize_gemini_image_config(
+                    generation_config.imageConfig,
+                    drop_unsupported=model_defaults.drop_unsupported_params,
+                )
+            )
+
+    effective_effort = (
+        generation_config.reasoningEffort if generation_config else None
+    ) or req.reasoningEffort
+    if effective_effort is not None and (
+        generation_config is None or generation_config.thinkingConfig is None
+    ):
+        level = _parse_thinking_level(effective_effort)
+        if level is not None:
+            if generation_config_overrides is None:
+                generation_config_overrides = {}
+            generation_config_overrides["thinking_config"] = AistudioThinkingConfig(
+                level=level, mode=1
+            ).to_wire()
+        elif (
+            generation_config_overrides is not None
+            and "thinking_config" in generation_config_overrides
+        ):
+            generation_config_overrides["thinking_config"] = None
+
+    return NormalizedGeminiRequest(
+        model=model,
+        contents=contents,
+        system_instruction=system_instruction,
+        tools=tools if tools is not None else None,
+        tool_config=tool_config,
+        safety_settings=_normalize_gemini_safety_settings(
+            req.safetySettings,
+            drop_unsupported=model_defaults.drop_unsupported_params,
+        )
+        if req.safetySettings is not None
+        else None,
+        temperature=generation_config.temperature if generation_config else None,
+        top_p=generation_config.topP if generation_config else None,
+        top_k=generation_config.topK if generation_config else None,
+        max_tokens=generation_config.maxOutputTokens if generation_config else None,
+        generation_config_overrides=generation_config_overrides or None,
+    )

@@ -1,0 +1,902 @@
+import pytest
+
+from aistudio_api.api.schemas import (
+    GeminiContent,
+    GeminiGenerateContentRequest,
+    GeminiGenerationConfig,
+    GeminiPart,
+)
+from aistudio_api.application.chat_service import normalize_gemini_request
+from aistudio_api.infrastructure.gateway.wire_types import AistudioImageOutputMode
+
+
+def test_normalize_gemini_request_exposes_generation_config_overrides():
+    req = GeminiGenerateContentRequest(
+        contents=[GeminiContent(role="user", parts=[GeminiPart(text="hello")])],
+        generationConfig=GeminiGenerationConfig(
+            stopSequences=["6"],
+            temperature=1,
+            topP=0.95,
+            topK=64,
+            maxOutputTokens=65536,
+            responseMimeType="text/plain",
+            responseSchema={
+                "type": "object",
+                "properties": {"test_response": {"type": "string"}},
+                "propertyOrdering": ["test_response"],
+            },
+            presencePenalty=0.1,
+            frequencyPenalty=0.2,
+            responseLogprobs=True,
+            logprobs=5,
+            mediaResolution=2,
+            thinkingConfig=[1, None, None, 3],
+        ),
+    )
+
+    normalized = normalize_gemini_request(req, "models/gemini-3.1-flash-image-preview")
+
+    assert normalized.generation_config_overrides == {
+        "stop_sequences": ["6"],
+        "max_tokens": 65536,
+        "temperature": 1,
+        "top_p": 0.95,
+        "top_k": 64,
+        "response_mime_type": "text/plain",
+        "response_schema": [
+            6,
+            None,
+            None,
+            None,
+            None,
+            None,
+            [["test_response", [1]]],
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            ["test_response"],
+        ],
+        "presence_penalty": 0.1,
+        "frequency_penalty": 0.2,
+        "response_logprobs": True,
+        "logprobs": 5,
+        "media_resolution": 2,
+        "thinking_config": [1, None, None, 3],
+    }
+
+
+def test_normalize_gemini_request_maps_official_image_generation_fields():
+    req = GeminiGenerateContentRequest.model_validate(
+        {
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [
+                        {
+                            "inlineData": {
+                                "mimeType": "image/jpeg",
+                                "data": "/9j/4AAQSkZJRgABAQAA....",
+                            }
+                        },
+                        {"text": "INSERT_INPUT_HERE"},
+                    ],
+                }
+            ],
+            "generationConfig": {
+                "responseModalities": ["IMAGE", "TEXT"],
+                "thinkingConfig": {"thinkingLevel": "HIGH"},
+                "imageConfig": {
+                    "aspectRatio": "9:16",
+                    "imageSize": "4K",
+                    "personGeneration": "",
+                },
+            },
+            "tools": [
+                {
+                    "googleSearch": {
+                        "searchTypes": {
+                            "webSearch": {},
+                            "imageSearch": {},
+                        }
+                    }
+                }
+            ],
+        }
+    )
+
+    normalized = normalize_gemini_request(req, "models/gemini-3.1-flash-image-preview")
+
+    assert normalized.tools == [[None, None, None, [None, [[], []]]]]
+    assert normalized.generation_config_overrides == {
+        "image_output_mode": AistudioImageOutputMode.text_and_image(),
+        "thinking_config": [1, None, None, 3],
+        "output_resolution": ["9:16", "4K"],
+    }
+    assert normalized.contents[0].parts[0].inline_data == (
+        "image/jpeg",
+        "/9j/4AAQSkZJRgABAQAA....",
+    )
+
+
+def test_normalize_gemini_request_encodes_function_declarations_to_wire_tools():
+    req = GeminiGenerateContentRequest.model_validate(
+        {
+            "contents": [{"role": "user", "parts": [{"text": "hello"}]}],
+            "tools": [
+                {
+                    "functionDeclarations": [
+                        {
+                            "name": "getWeather",
+                            "description": "gets the weather for a requested city",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"city": {"type": "string"}},
+                                "propertyOrdering": ["city"],
+                            },
+                        }
+                    ]
+                }
+            ],
+        }
+    )
+    normalized = normalize_gemini_request(req, "models/gemma-4-31b-it")
+
+    assert normalized.tools == [
+        [
+            None,
+            [
+                [
+                    "getWeather",
+                    "gets the weather for a requested city",
+                    [
+                        6,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        [["city", [1]]],
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        ["city"],
+                    ],
+                ]
+            ],
+        ],
+    ]
+
+
+def test_normalize_gemini_request_does_not_inject_unrequested_default_tools():
+    req = GeminiGenerateContentRequest(
+        contents=[GeminiContent(role="user", parts=[GeminiPart(text="hello")])],
+    )
+
+    normalized_gemma = normalize_gemini_request(req, "models/gemma-4-31b-it")
+    assert normalized_gemma.tools is None
+
+    normalized_gemini = normalize_gemini_request(req, "models/gemini-3.8-flash")
+    assert normalized_gemini.tools is None
+
+    normalized_image = normalize_gemini_request(
+        req, "models/gemini-3.1-flash-image-preview"
+    )
+    assert normalized_image.tools is None
+    assert normalized_image.generation_config_overrides is None
+
+
+def test_normalize_gemini_request_thinking_and_reasoning_effort():
+    # 1. No thinkingConfig or reasoningEffort -> no thinking_config injected
+    req_plain = GeminiGenerateContentRequest.model_validate(
+        {
+            "contents": [{"role": "user", "parts": [{"text": "hello"}]}],
+            "generationConfig": {"temperature": 0.7},
+        }
+    )
+    norm_plain = normalize_gemini_request(req_plain, "models/gemini-3.8-flash")
+    assert norm_plain.generation_config_overrides == {"temperature": 0.7}
+
+    # 2. Empty thinkingConfig or includeThoughts=False or thinkingBudget=0 -> never forces HIGH
+    for empty_tc in (
+        {},
+        {"includeThoughts": True},
+        {"includeThoughts": False},
+        {"thinkingBudget": 0},
+        {"thinkingLevel": "NONE"},
+    ):
+        req_tc = GeminiGenerateContentRequest.model_validate(
+            {
+                "contents": [{"role": "user", "parts": [{"text": "hello"}]}],
+                "generationConfig": {"thinkingConfig": empty_tc},
+            }
+        )
+        norm_tc = normalize_gemini_request(req_tc, "models/gemini-3.8-flash")
+        assert norm_tc.generation_config_overrides is None
+
+    # 3. Positive thinkingBudget -> [1, budget]
+    req_budget = GeminiGenerateContentRequest.model_validate(
+        {
+            "contents": [{"role": "user", "parts": [{"text": "hello"}]}],
+            "generationConfig": {"thinkingConfig": {"thinkingBudget": 2048}},
+        }
+    )
+    norm_budget = normalize_gemini_request(req_budget, "models/gemini-3.8-flash")
+    assert norm_budget.generation_config_overrides == {"thinking_config": [1, 2048]}
+
+    # 4. Top-level reasoning_effort (e.g. Tavern "reasoning_effort": "low") -> [1, None, None, 1]
+    req_effort = GeminiGenerateContentRequest.model_validate(
+        {
+            "contents": [{"role": "user", "parts": [{"text": "hello"}]}],
+            "generationConfig": {"temperature": 1.0},
+            "reasoning_effort": "low",
+        }
+    )
+    norm_effort = normalize_gemini_request(req_effort, "models/gemini-4-argon")
+    assert norm_effort.generation_config_overrides == {
+        "temperature": 1.0,
+        "thinking_config": [1, None, None, 1],
+    }
+
+
+def test_normalize_gemini_request_encodes_builtin_tools_to_wire():
+    req = GeminiGenerateContentRequest.model_validate(
+        {
+            "contents": [{"role": "user", "parts": [{"text": "hello"}]}],
+            "tools": [
+                {
+                    "googleSearch": {},
+                    "googleMaps": {},
+                    "urlContext": {},
+                    "codeExecution": {},
+                }
+            ],
+        }
+    )
+    normalized = normalize_gemini_request(req, "models/gemini-3.5-flash")
+
+    assert normalized.tools == [
+        [[]],
+        [None, None, None, [None, [[]]]],
+        [None, None, None, None, None, None, None, None, None, None, []],
+        [None, None, None, None, None, None, None, []],
+    ]
+
+
+def test_normalize_gemini_request_rejects_gemma_unsupported_builtin_tool():
+    req = GeminiGenerateContentRequest.model_validate(
+        {
+            "contents": [{"role": "user", "parts": [{"text": "hello"}]}],
+            "tools": [
+                {
+                    "googleMaps": {},
+                }
+            ],
+        }
+    )
+    with pytest.raises(ValueError, match="not allowed"):
+        normalize_gemini_request(req, "models/gemma-4-31b-it")
+
+
+def test_normalize_gemini_request_empty_tools_disables_model_defaults():
+    req = GeminiGenerateContentRequest(
+        contents=[GeminiContent(role="user", parts=[GeminiPart(text="hello")])],
+        tools=[],
+    )
+
+    normalized = normalize_gemini_request(req, "models/gemma-4-31b-it")
+
+    assert normalized.tools == []
+
+
+def test_normalize_gemini_request_rejects_unsupported_person_generation():
+    req = GeminiGenerateContentRequest.model_validate(
+        {
+            "contents": [{"role": "user", "parts": [{"text": "hello"}]}],
+            "generationConfig": {
+                "imageConfig": {
+                    "personGeneration": "ALLOW_ADULT",
+                }
+            },
+        }
+    )
+
+    with pytest.raises(ValueError, match="personGeneration"):
+        normalize_gemini_request(req, "models/gemini-3.1-flash-image-preview")
+
+
+def test_normalize_gemini_request_maps_official_text_model_fields():
+    req = GeminiGenerateContentRequest.model_validate(
+        {
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [
+                        {"text": "INSERT_INPUT_HERE"},
+                    ],
+                }
+            ],
+            "generationConfig": {
+                "thinkingConfig": {"thinkingLevel": "HIGH"},
+            },
+            "safetySettings": [
+                {
+                    "category": "HARM_CATEGORY_HARASSMENT",
+                    "threshold": "BLOCK_LOW_AND_ABOVE",
+                },
+                {
+                    "category": "HARM_CATEGORY_HATE_SPEECH",
+                    "threshold": "BLOCK_NONE",
+                },
+                {
+                    "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+                    "threshold": "BLOCK_ONLY_HIGH",
+                },
+                {
+                    "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
+                    "threshold": "BLOCK_MEDIUM_AND_ABOVE",
+                },
+            ],
+            "tools": [
+                {"urlContext": {}},
+                {"codeExecution": {}},
+                {"googleSearch": {}},
+            ],
+        }
+    )
+
+    normalized = normalize_gemini_request(req, "models/gemini-3.5-flash")
+
+    assert normalized.tools == [
+        [None, None, None, None, None, None, None, []],
+        [[]],
+        [None, None, None, [None, [[]]]],
+    ]
+    assert normalized.generation_config_overrides == {
+        "thinking_config": [1, None, None, 3],
+    }
+    assert normalized.safety_settings == [
+        [None, None, 7, 1],
+        [None, None, 8, 4],
+        [None, None, 9, 3],
+        [None, None, 10, 2],
+    ]
+
+
+def test_normalize_gemini_request_drops_unknown_safety_category_when_enabled(
+    monkeypatch, tmp_path
+):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+model_defaults:
+  drop_unsupported_params: true
+  profiles:
+    - name: gemini_models
+      match:
+        prefixes: [gemini-]
+      drop_unsupported_params: true
+"""
+    )
+    monkeypatch.setenv("AISTUDIO_CONFIG_FILE", str(config_path))
+    from aistudio_api.infrastructure.gateway.model_defaults import (
+        invalidate_config_cache,
+    )
+
+    invalidate_config_cache()
+
+    req = GeminiGenerateContentRequest.model_validate(
+        {
+            "contents": [{"role": "user", "parts": [{"text": "hello"}]}],
+            "safetySettings": [
+                {
+                    "category": "HARM_CATEGORY_CIVIC_INTEGRITY",
+                    "threshold": "BLOCK_NONE",
+                },
+                {
+                    "category": "HARM_CATEGORY_HARASSMENT",
+                    "threshold": "BLOCK_NONE",
+                },
+            ],
+        }
+    )
+
+    normalized = normalize_gemini_request(req, "models/gemini-2.5-flash")
+    assert normalized.safety_settings == [[None, None, 7, 4]]
+    invalidate_config_cache()
+
+
+def test_normalize_gemini_request_rejects_unknown_safety_category_when_disabled(
+    monkeypatch, tmp_path
+):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+model_defaults:
+  drop_unsupported_params: false
+  profiles:
+    - name: gemini_models
+      match:
+        prefixes: [gemini-]
+      drop_unsupported_params: false
+"""
+    )
+    monkeypatch.setenv("AISTUDIO_CONFIG_FILE", str(config_path))
+    from aistudio_api.infrastructure.gateway.model_defaults import (
+        invalidate_config_cache,
+    )
+
+    invalidate_config_cache()
+
+    req = GeminiGenerateContentRequest.model_validate(
+        {
+            "contents": [{"role": "user", "parts": [{"text": "hello"}]}],
+            "safetySettings": [
+                {
+                    "category": "HARM_CATEGORY_CIVIC_INTEGRITY",
+                    "threshold": "BLOCK_NONE",
+                }
+            ],
+        }
+    )
+
+    with pytest.raises(ValueError, match="Unsupported safety category"):
+        normalize_gemini_request(req, "models/gemini-2.5-flash")
+    invalidate_config_cache()
+
+
+def test_normalize_gemini_request_mode_none_suppresses_tools():
+    """Verify toolConfig mode=NONE suppresses tools for pure text output."""
+    req = GeminiGenerateContentRequest.model_validate(
+        {
+            "contents": [
+                {"role": "user", "parts": [{"text": "Hello, please summarize."}]}
+            ],
+            "tools": [
+                {
+                    "functionDeclarations": [
+                        {
+                            "name": "read",
+                            "description": "read file",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"path": {"type": "string"}},
+                                "required": ["path"],
+                            },
+                        }
+                    ]
+                }
+            ],
+            "toolConfig": {
+                "functionCallingConfig": {
+                    "mode": "NONE",
+                }
+            },
+        }
+    )
+    normalized = normalize_gemini_request(req, "models/gemini-3.8-flash")
+    # Tools and tool_config must both be None so MakerSuite generates text without calling functions
+    assert normalized.tools is None
+    assert normalized.tool_config is None
+
+
+def test_normalize_gemini_request_supports_snake_case_function_declarations():
+    """Verify tools with snake_case function_declarations (e.g. SillyTavern anti-truncation) are correctly converted."""
+    req = GeminiGenerateContentRequest.model_validate(
+        {
+            "contents": [{"role": "user", "parts": [{"text": "Hello"}]}],
+            "tools": [
+                {
+                    "function_declarations": [
+                        {
+                            "name": "emit_complete_response_f8dce5fa2102a5307ad6412d",
+                            "description": "Emit the complete final user-visible reply exactly once.",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {
+                                    "content": {
+                                        "type": "string",
+                                        "description": "The complete final reply shown to the user.",
+                                    }
+                                },
+                                "required": ["content"],
+                                "property_ordering": ["content"],
+                            },
+                        }
+                    ]
+                }
+            ],
+            "tool_config": {
+                "function_calling_config": {
+                    "mode": "AUTO",
+                }
+            },
+        }
+    )
+    normalized = normalize_gemini_request(req, "models/gemini-3.8-flash")
+    assert normalized.tools is not None
+    assert len(normalized.tools) == 1
+    # Single Tool entry with function declarations at index 1
+    assert normalized.tools[0][0] is None
+    func_decls = normalized.tools[0][1]
+    assert isinstance(func_decls, list)
+    assert len(func_decls) == 1
+    decl_entry = func_decls[0]
+    assert isinstance(decl_entry, list)
+    assert decl_entry[0] == "emit_complete_response_f8dce5fa2102a5307ad6412d"
+    assert decl_entry[1] == "Emit the complete final user-visible reply exactly once."
+    # Parameters schema wire format
+    schema_wire = decl_entry[2]
+    assert isinstance(schema_wire, list)
+    assert schema_wire[0] == 6  # OBJECT
+    assert schema_wire[6] == [
+        ["content", [1, None, "The complete final reply shown to the user."]]
+    ]
+    assert schema_wire[7] == ["content"]
+    assert schema_wire[22] == ["content"]
+
+
+def test_encode_schema_to_wire_lossless_metadata():
+    """Verify encode_schema_to_wire preserves description, enum, format, nullable, anyOf, default, constraints."""
+    from aistudio_api.application.chat_service import encode_schema_to_wire
+
+    schema = {
+        "type": "object",
+        "title": "TaskPayload",
+        "description": "Schema for task operations",
+        "format": "custom-format",
+        "nullable": False,
+        "minProperties": 1,
+        "maxProperties": 10,
+        "properties": {
+            "op": {
+                "type": "string",
+                "description": "Operation type",
+                "enum": ["init", "start", "done", "rm"],
+            },
+            "count": {
+                "type": "integer",
+                "description": "Number of items",
+                "minimum": 1,
+                "maximum": 100,
+                "default": 1,
+            },
+            "items": {
+                "type": "array",
+                "description": "List of task strings",
+                "minItems": 1,
+                "maxItems": 50,
+                "items": {"type": "string", "maxLength": 128},
+            },
+            "options": {
+                "anyOf": [
+                    {"type": "string", "description": "String option"},
+                    {"type": "boolean", "description": "Bool option"},
+                ]
+            },
+        },
+        "required": ["op"],
+        "propertyOrdering": ["op", "count", "items", "options"],
+    }
+
+    wire = encode_schema_to_wire(schema)
+
+    # Wire array checks
+    assert wire[0] == 6  # OBJECT
+    assert wire[1] == "custom-format"  # Field 2: format
+    assert wire[2] == "Schema for task operations"  # Field 3: description
+    assert wire[3] is False  # Field 4: nullable
+    assert wire[7] == ["op"]  # Field 8: required
+    assert wire[8] == 1  # Field 9: minProperties
+    assert wire[9] == 10  # Field 10: maxProperties
+    assert wire[22] == ["op", "count", "items", "options"]  # Field 23: propertyOrdering
+    assert (
+        len(wire) <= 23
+    )  # Google Schema proto strictly terminates at index 22 (Field 23)
+    # Properties checks
+    assert isinstance(wire[6], list)
+    props: dict[str, object] = {
+        str(item[0]): item[1]
+        for item in wire[6]
+        if isinstance(item, list) and len(item) >= 2
+    }
+    # op property
+    op_wire = props["op"]
+    assert isinstance(op_wire, list)
+    assert op_wire[0] == 1  # STRING
+    assert op_wire[2] == "Operation type"  # Field 3: description
+    assert op_wire[4] == ["init", "start", "done", "rm"]  # Field 5: enum
+
+    # count property
+    count_wire = props["count"]
+    assert isinstance(count_wire, list)
+    assert count_wire[0] == 3  # INTEGER
+    assert count_wire[2] == "Number of items"
+    assert count_wire[10] == 1  # minimum
+    assert count_wire[11] == 100  # maximum
+    assert len(count_wire) <= 23  # Google Schema proto strictly terminates at index 22
+    # items property
+    items_wire = props["items"]
+    assert isinstance(items_wire, list)
+    assert items_wire[0] == 5  # ARRAY
+    assert items_wire[2] == "List of task strings"
+    items_sub_wire = items_wire[5]
+    assert isinstance(items_sub_wire, list)
+    assert items_sub_wire[0] == 1  # items schema string
+    assert items_sub_wire[13] == 128  # items schema maxLength
+    assert items_wire[20] == 50  # maxItems
+    assert items_wire[21] == 1  # minItems
+
+    # options property (anyOf)
+    options_wire = props["options"]
+    assert isinstance(options_wire, list)
+    any_of_list = options_wire[17]
+    assert isinstance(any_of_list, list)
+    assert len(any_of_list) == 2
+    first_sub = any_of_list[0]
+    assert isinstance(first_sub, list)
+    assert first_sub[0] == 1  # string
+    assert first_sub[2] == "String option"
+    second_sub = any_of_list[1]
+    assert isinstance(second_sub, list)
+    assert second_sub[0] == 4  # boolean
+    assert second_sub[2] == "Bool option"
+
+
+def test_normalize_gemini_request_parameters_json_schema_for_omp_tools():
+    """Verify OMP tools (read, glob, todo) with parametersJsonSchema are fully encoded into wire tools."""
+    read_decl = {
+        "name": "read",
+        "description": "Use `read` for static web; browser only if needed.",
+        "parametersJsonSchema": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Local path, internal URI, or URL; selectors inline.",
+                }
+            },
+            "required": ["path"],
+        },
+    }
+    glob_decl = {
+        "name": "glob",
+        "description": "Glob files/dirs: ;;-separated paths or internal URLs.",
+        "parametersJsonSchema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "hidden": {"type": "boolean"},
+                "gitignore": {"type": "boolean"},
+                "limit": {"type": "number"},
+            },
+            "propertyOrdering": ["path", "hidden", "gitignore", "limit"],
+        },
+    }
+    todo_decl = {
+        "name": "todo",
+        "description": "Tasks identified by verbatim content.",
+        "parametersJsonSchema": {
+            "type": "object",
+            "properties": {
+                "op": {
+                    "enum": [
+                        "init",
+                        "start",
+                        "done",
+                        "rm",
+                        "drop",
+                        "block",
+                        "unblock",
+                        "append",
+                        "view",
+                    ],
+                    "type": "string",
+                },
+                "list": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "phase": {"type": "string"},
+                            "items": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "{minItems: 1}",
+                            },
+                        },
+                        "required": ["phase", "items"],
+                        "propertyOrdering": ["phase", "items"],
+                    },
+                    "description": "phases for init",
+                },
+                "task": {
+                    "type": "string",
+                    "description": "verbatim task content",
+                },
+                "phase": {"type": "string"},
+                "items": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "tasks for flat init or append",
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "blocker note for block",
+                },
+            },
+            "required": ["op"],
+            "propertyOrdering": [
+                "op",
+                "list",
+                "task",
+                "phase",
+                "items",
+                "reason",
+            ],
+        },
+    }
+
+    req = GeminiGenerateContentRequest.model_validate(
+        {
+            "contents": [{"role": "user", "parts": [{"text": "inspect tools"}]}],
+            "tools": [
+                {
+                    "functionDeclarations": [read_decl, glob_decl, todo_decl],
+                }
+            ],
+        }
+    )
+
+    normalized = normalize_gemini_request(req, "models/gemini-3.7-flash")
+    assert normalized.tools is not None
+    assert len(normalized.tools) == 1
+    # Function declarations tool is at index 1
+    decls = normalized.tools[0][1]
+    assert isinstance(decls, list)
+    assert len(decls) == 3
+
+    # 1. READ tool wire validation
+    read_wire = decls[0]
+    assert read_wire[0] == "read"
+    assert "Use `read`" in str(read_wire[1])
+    read_params = read_wire[2]
+    assert isinstance(read_params, list)
+    assert read_params[0] == 6  # OBJECT (never 0)
+    assert len(read_params) <= 23  # Never exceeds index 22
+    assert read_params[6] == [
+        ["path", [1, None, "Local path, internal URI, or URL; selectors inline."]]
+    ]
+    assert read_params[7] == ["path"]  # required
+
+    # 2. GLOB tool wire validation
+    glob_wire = decls[1]
+    assert glob_wire[0] == "glob"
+    glob_params = glob_wire[2]
+    assert isinstance(glob_params, list)
+    assert glob_params[0] == 6  # OBJECT (never 0)
+    assert len(glob_params) <= 23  # Never exceeds index 22
+    glob_props = {item[0]: item[1] for item in glob_params[6]}
+    assert glob_props["path"][0] == 1  # string
+    assert glob_props["hidden"][0] == 4  # boolean
+    assert glob_props["gitignore"][0] == 4  # boolean
+    assert glob_props["limit"][0] == 2  # number
+    assert glob_params[22] == [
+        "path",
+        "hidden",
+        "gitignore",
+        "limit",
+    ]  # propertyOrdering
+
+    # 3. TODO tool wire validation
+    todo_wire = decls[2]
+    assert todo_wire[0] == "todo"
+    todo_params = todo_wire[2]
+    assert isinstance(todo_params, list)
+    assert todo_params[0] == 6  # OBJECT (never 0)
+    assert len(todo_params) <= 23  # Never exceeds index 22
+    assert todo_params[7] == ["op"]  # required
+    todo_props = {item[0]: item[1] for item in todo_params[6]}
+    # op has enum
+    assert todo_props["op"][0] == 1
+    assert todo_props["op"][4] == [
+        "init",
+        "start",
+        "done",
+        "rm",
+        "drop",
+        "block",
+        "unblock",
+        "append",
+        "view",
+    ]
+    # list has items schema with phase & items
+    assert todo_props["list"][0] == 5  # array
+    list_item_schema = todo_props["list"][5]
+    assert list_item_schema[0] == 6  # object
+    assert list_item_schema[7] == ["phase", "items"]  # required
+    # propertyOrdering
+    assert todo_params[22] == [
+        "op",
+        "list",
+        "task",
+        "phase",
+        "items",
+        "reason",
+    ]
+
+
+def test_unboxed_single_pair_decoding():
+    """Verify _decode_wire_struct handles single unboxed key-value pairs."""
+    from aistudio_api.infrastructure.gateway.wire_parser import _decode_wire_struct
+
+    unboxed = ["path", [None, None, "test.txt"]]
+    assert _decode_wire_struct(unboxed) == {"path": "test.txt"}
+
+
+def test_normalize_gemini_request_preserves_system_instruction_thought_signature():
+    """Verify thought_signature is preserved on systemInstruction text parts."""
+    req = GeminiGenerateContentRequest.model_validate(
+        {
+            "contents": [{"role": "user", "parts": [{"text": "Hello"}]}],
+            "systemInstruction": {
+                "role": "user",
+                "parts": [
+                    {
+                        "text": "System prompt with thought signature",
+                        "thoughtSignature": "sys_sig_123",
+                    }
+                ],
+            },
+        }
+    )
+    normalized = normalize_gemini_request(req, "gemini-3.7-flash")
+    assert normalized.system_instruction is not None
+    assert len(normalized.system_instruction.parts) == 1
+    sys_part = normalized.system_instruction.parts[0]
+    assert sys_part.text == "System prompt with thought signature"
+    assert sys_part.thought_signature == "sys_sig_123"
+
+
+def test_normalize_gemini_request_deduplicates_and_covers_builtin_tools():
+    """Verify multiple/duplicate search declarations are deduplicated and covered properly."""
+    req = GeminiGenerateContentRequest.model_validate(
+        {
+            "contents": [{"role": "user", "parts": [{"text": "Hello"}]}],
+            "tools": [
+                {"googleSearch": {}},
+                {"googleSearch": {}},
+                {"codeExecution": {}},
+            ],
+        }
+    )
+    normalized = normalize_gemini_request(req, "gemini-3.7-flash")
+    # tools should have codeExecution and googleSearch, but googleSearch must not be duplicated!
+    assert normalized.tools is not None
+    # code_execution = [[]], google_search = [None, None, None, [None, [[]]]]
+    assert len(normalized.tools) == 2
+    assert [[]] in normalized.tools
+    assert [None, None, None, [None, [[]]]] in normalized.tools

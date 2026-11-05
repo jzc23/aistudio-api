@@ -1,0 +1,123 @@
+"""Unit tests for zero-disk multimodal pipeline and image generation tools."""
+
+from __future__ import annotations
+
+from aistudio_api.api.schemas import (
+    GeminiContent,
+    GeminiGenerateContentRequest,
+    GeminiPart,
+)
+from aistudio_api.application.chat_service import normalize_gemini_request
+
+
+def test_multimodal_zero_disk_io_pipeline():
+    """Verify inline data stays in memory with zero temp file creation."""
+    fake_base64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+    req = GeminiGenerateContentRequest.model_validate(
+        {
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [
+                        {"inlineData": {"mimeType": "image/png", "data": fake_base64}},
+                        {"text": "Analyze this image"},
+                    ],
+                }
+            ]
+        }
+    )
+    normalized = normalize_gemini_request(req, "gemini-3.5-flash")
+    part0 = normalized.contents[0].parts[0]
+    assert part0.inline_data == ("image/png", fake_base64)
+    wire_part = part0.to_wire()
+    assert wire_part == [None, None, ["image/png", fake_base64]]
+
+
+def test_chat_service_does_not_guess_thought_for_multi_parts():
+    """Verify model multi-part messages do not force thought=True."""
+    req = GeminiGenerateContentRequest(
+        contents=[
+            GeminiContent(
+                role="model",
+                parts=[
+                    GeminiPart(text="Paragraph 1"),
+                    GeminiPart(text="Paragraph 2"),
+                    GeminiPart(text="Paragraph 3"),
+                ],
+            )
+        ]
+    )
+    normalized = normalize_gemini_request(req, "gemini-3.5-flash")
+    model_content = normalized.contents[0]
+    assert len(model_content.parts) == 3
+    assert not any(p.thought for p in model_content.parts)
+
+    req_with_thought = GeminiGenerateContentRequest(
+        contents=[
+            GeminiContent(
+                role="model",
+                parts=[
+                    GeminiPart(text="Thinking...", thought=True),
+                    GeminiPart(text="Answer with sig", thoughtSignature="sig123"),
+                    GeminiPart(text="Normal answer"),
+                ],
+            )
+        ]
+    )
+    norm_thought = normalize_gemini_request(req_with_thought, "gemini-3.5-flash")
+    assert norm_thought.contents[0].parts[0].thought is True
+    assert norm_thought.contents[0].parts[1].thought is False
+    assert norm_thought.contents[0].parts[1].thought_signature == "sig123"
+    assert norm_thought.contents[0].parts[2].thought is False
+
+
+def test_multimodal_function_response_unpacks_inline_data():
+    """Verify that functionResponse parts containing inlineData (from tools like read)
+    are unpacked into sibling parts for MakerSuite Wire encoding."""
+    fake_base64 = "UklGRvaTAgBXRUJQVlA4IOqTAgDwgAmdASogBnIDPm0ylEckIy"
+    req = GeminiGenerateContentRequest.model_validate(
+        {
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [
+                        {
+                            "functionResponse": {
+                                "name": "read",
+                                "response": {"output": "Read image file [image/webp]"},
+                                "id": "call_12345",
+                                "parts": [
+                                    {
+                                        "inlineData": {
+                                            "mimeType": "image/webp",
+                                            "data": fake_base64,
+                                        }
+                                    }
+                                ],
+                            }
+                        }
+                    ],
+                }
+            ]
+        }
+    )
+    normalized = normalize_gemini_request(req, "gemini-3.8-flash")
+    content = normalized.contents[0]
+    assert len(content.parts) == 2
+
+    part_fr = content.parts[0]
+    assert part_fr.function_response is not None
+    assert part_fr.function_response[0] == "read"
+    assert len(part_fr.function_response) > 2
+    assert part_fr.function_response[2] == "call_12345"
+    part_img = content.parts[1]
+    assert part_img.inline_data == ("image/webp", fake_base64)
+
+    # 验证 Wire 编码
+    wire = content.to_wire()
+    assert wire[1] == "user"
+    assert len(wire[0]) == 2
+    # Wire part 0 是 function_response (index 11)
+    assert wire[0][0][11][0] == "read"
+    # Wire part 1 是 inline_data (index 2)
+    assert wire[0][1][2] == ["image/webp", fake_base64]
