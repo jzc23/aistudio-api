@@ -2,6 +2,7 @@ import { createRouter, createWebHistory, type RouteRecordRaw } from 'vue-router'
 import { useAuthStore } from '@/stores/auth.ts'
 const LoginView = () => import('@/views/LoginView.vue')
 const DashboardView = () => import('@/views/DashboardView.vue')
+const StatsView = () => import('@/views/StatsView.vue')
 const AccountsView = () => import('@/views/AccountsView.vue')
 const SettingsView = () => import('@/views/SettingsView.vue')
 const LogsView = () => import('@/views/LogsView.vue')
@@ -18,6 +19,12 @@ const routes: RouteRecordRaw[] = [
     name: 'dashboard',
     component: DashboardView,
     meta: { title: '控制面板' },
+  },
+  {
+    path: '/usage',
+    name: 'usage',
+    component: StatsView,
+    meta: { title: '用量统计' },
   },
   {
     path: '/accounts',

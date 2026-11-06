@@ -65,3 +65,27 @@ export interface TestSignerServerResponse {
   error?: string
   data?: Record<string, unknown>
 }
+
+export interface AtgFeatureConfig {
+  mode: string
+  mode_by_format?: Record<string, string>
+  tool_prefix?: string
+  control_position?: string
+  strict?: boolean
+  empty_retries?: number
+  recovery?: string
+  side_buffer_bytes?: number
+  client_synthetic_guard?: boolean
+  max_response_bytes?: number
+  text_model_pattern?: string
+  non_text_model_pattern?: string
+}
+
+export interface FeaturesConfig {
+  formats: { openai: boolean }
+  atg: AtgFeatureConfig
+}
+
+export interface FeaturesConfigResponse {
+  features: FeaturesConfig
+}

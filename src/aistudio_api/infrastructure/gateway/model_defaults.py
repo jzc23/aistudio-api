@@ -619,6 +619,38 @@ def get_features_config(
     return _deep_merge(merged, yaml_features)
 
 
+def update_configured_features(
+    updates: dict[str, object],
+    config_path: str | os.PathLike[str] | None = None,
+) -> dict[str, object]:
+    """结构化合并更新 config.yaml 的 ``features`` 段并刷新缓存。
+
+    ``updates`` 是 features 的局部子树（如 ``{"atg": {"mode": "prefer"}}``），
+    与既有 YAML 内容做深合并后整体写回；返回归一化后的完整 features。
+    """
+    if not isinstance(updates, dict) or not updates:
+        raise ValueError("features updates must be a non-empty object")
+
+    resolved_path = _resolve_config_path(config_path)
+    content = (
+        resolved_path.read_text(encoding="utf-8") if resolved_path.exists() else ""
+    )
+    parsed = yaml.safe_load(content) or {}
+    if not isinstance(parsed, dict):
+        parsed = {}
+
+    raw_features = parsed.get("features")
+    features_dict = dict(raw_features) if isinstance(raw_features, dict) else {}
+    merged = _deep_merge(features_dict, updates)
+    parsed["features"] = merged
+    resolved_path.write_text(
+        yaml.dump(parsed, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+    invalidate_config_cache()
+    return get_features_config(resolved_path)
+
+
 @lru_cache(maxsize=8)
 def _compiled_profiles(config_path: str) -> tuple[ModelProfile, ...]:
     config = _load_yaml_config(Path(config_path))

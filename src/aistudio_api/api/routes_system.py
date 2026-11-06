@@ -468,6 +468,37 @@ class LoggingConfigRequest(BaseModel):
     dump_dir: str | None = None
 
 
+@protected_router.get("/config/features")
+async def get_features_config_route() -> dict[str, object]:
+    """获取功能开关段（features: ATG 抗截断 / OpenAI 协议 / 账号双保活）。"""
+    from aistudio_api.infrastructure.gateway.model_defaults import (
+        get_features_config,
+    )
+
+    return {"features": get_features_config()}
+
+
+class FeaturesConfigRequest(BaseModel):
+    """features 段的局部子树，深合并写入 config.yaml 后热生效。"""
+
+    updates: dict[str, object]
+
+
+@protected_router.put("/config/features")
+async def update_features_config(req: FeaturesConfigRequest) -> dict[str, object]:
+    """更新功能开关配置（ATG / OpenAI 协议 / 双保活），持久化并热生效。"""
+    from aistudio_api.infrastructure.gateway.model_defaults import (
+        update_configured_features,
+    )
+
+    try:
+        features = update_configured_features(req.updates)
+    except ValueError as exc:
+        raise HTTPException(400, detail=str(exc)) from exc
+    logger.info("功能开关配置已更新: %s", sorted(req.updates.keys()))
+    return {"features": features}
+
+
 @protected_router.put("/config/logging")
 async def update_logging_config(req: LoggingConfigRequest) -> dict[str, object]:
     """更新系统日志级别与请求转储配置，并持久化到 config.yaml。"""

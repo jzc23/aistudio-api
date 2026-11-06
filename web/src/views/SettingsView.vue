@@ -5,6 +5,7 @@ import { useToastStore } from '@/stores/toast.ts'
 import type { SystemConfig } from '@/types/system.ts'
 import ApiKeyManagerCard from '@/components/settings/ApiKeyManagerCard.vue'
 import LogConfigCard from '@/components/settings/LogConfigCard.vue'
+import FeaturesCard from '@/components/settings/FeaturesCard.vue'
 import VisualConfigEditor from '@/components/config/VisualConfigEditor.vue'
 import SignerServerCard from '@/components/settings/SignerServerCard.vue'
 import {
@@ -140,6 +141,10 @@ onMounted(() => {
       :initial-config="config"
       @saved="loadConfig"
     />
+
+    <!-- Feature Toggles Card (ATG / OpenAI / Keepalive) -->
+    <FeaturesCard />
+
     <!-- WAA Signer Servers & Features Binding Card -->
     <SignerServerCard @switched="loadConfig" />
 

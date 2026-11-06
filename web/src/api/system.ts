@@ -9,6 +9,7 @@ import type {
   UpdateApiKeyRequest,
   UpdateLoggingConfigRequest,
   UpdateLoggingConfigResponse,
+  FeaturesConfigResponse,
   HealthCheckResponse,
   SignerServerItem,
   SignerServersResponse,
@@ -63,6 +64,18 @@ export const systemApi = {
     return request<UpdateLoggingConfigResponse>('/config/logging', {
       method: 'PUT',
       body: JSON.stringify(req),
+    })
+  },
+
+
+  getFeatures(): Promise<FeaturesConfigResponse> {
+    return request<FeaturesConfigResponse>('/config/features')
+  },
+
+  updateFeatures(updates: Record<string, unknown>): Promise<FeaturesConfigResponse> {
+    return request<FeaturesConfigResponse>('/config/features', {
+      method: 'PUT',
+      body: JSON.stringify({ updates }),
     })
   },
 
