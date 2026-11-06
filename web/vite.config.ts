@@ -30,9 +30,11 @@ export default defineConfig({
     emptyOutDir: true,
     rollupOptions: {
       output: {
-        entryFileNames: 'assets/[name].js',
-        chunkFileNames: 'assets/[name].js',
-        assetFileNames: 'assets/[name].[ext]',
+        // 文件名带内容哈希:每次构建产物 URL 变化,配合 index.html 的 no-store
+        // 彻底规避 Cloudflare/浏览器缓存旧版同名 JS 导致的"更新后界面不变"
+        entryFileNames: 'assets/[name]-[hash].js',
+        chunkFileNames: 'assets/[name]-[hash].js',
+        assetFileNames: 'assets/[name]-[hash].[ext]',
         manualChunks: {
           'vendor-vue': ['vue', 'vue-router', 'pinia'],
           'vendor-icons': ['lucide-vue-next'],
