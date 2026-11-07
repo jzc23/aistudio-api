@@ -1,8 +1,9 @@
 """诊断:RotateCookies 令牌轮转可行性(本地运行,Cookie 不外发)。
 
 用法(服务器项目目录下,先重启到含 /v1/cookies/rotate 的新版 waa-signer):
-    uv run python scripts/diag_rotatecookies.py data/accounts/<账号ID>/auth.json \
-        [--proxy http://host:port] [--signer http://127.0.0.1:8081]
+    uv run python scripts/diag_rotatecookies.py            # 自动选活跃账号(无则第一个)
+    uv run python scripts/diag_rotatecookies.py data/accounts/<账号ID>/auth.json
+    可选: --proxy http://host:port  --signer http://127.0.0.1:8081
 
 实验矩阵(每条路径都只打印状态码与 Cookie 名,绝不打印值):
   A1/A2  直连 httpx POST accounts.google.com/RotateCookies
@@ -194,17 +195,72 @@ async def try_via_signer(
         return {}
 
 
+def _default_auth_path() -> tuple[Path, str]:
+    """自动定位实验账号:优先活跃账号,否则注册表第一个,再退到目录扫描第一个。
+
+    返回 (auth.json 路径, auth_user);找不到账号直接退出。
+    """
+    import os
+
+    accounts_dir = Path(
+        os.environ.get("AISTUDIO_ACCOUNTS_DIR")
+        or (Path(__file__).resolve().parents[1] / "data" / "accounts")
+    )
+    if not accounts_dir.is_dir():
+        raise SystemExit(f"账号目录不存在: {accounts_dir}")
+
+    registry_path = accounts_dir / "registry.json"
+    candidates: list[tuple[str, str]] = []  # (account_id, auth_user)
+    if registry_path.is_file():
+        try:
+            registry = json.loads(registry_path.read_text(encoding="utf-8"))
+            accounts = registry.get("accounts") or {}
+            active_id = registry.get("active_account_id")
+            ordered = []
+            if active_id and active_id in accounts:
+                ordered.append(active_id)
+            ordered.extend(k for k in accounts if k != active_id)
+            candidates = [
+                (
+                    str(k),
+                    str((accounts[k] or {}).get("auth_user") or "0"),
+                )
+                for k in ordered
+            ]
+        except (OSError, json.JSONDecodeError):
+            pass
+    if not candidates:
+        candidates = [
+            (p.parent.name, "0")
+            for p in sorted(accounts_dir.glob("*/auth.json"))
+        ]
+    if not candidates:
+        raise SystemExit(f"{accounts_dir} 下没有找到任何账号(auth.json)")
+
+    account_id, auth_user = candidates[0]
+    path = accounts_dir / account_id / "auth.json"
+    if not path.is_file():
+        raise SystemExit(f"选中账号 {account_id} 但 auth.json 不存在: {path}")
+    print(f"自动选择账号: {account_id}(auth_user={auth_user},共 {len(candidates)} 个可用)")
+    return path, auth_user
+
+
 async def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("auth_json")
-    parser.add_argument("--auth-user", default="0")
+    parser.add_argument("auth_json", nargs="?", default=None)
+    parser.add_argument("--auth-user", default=None)
     parser.add_argument("--proxy", default=None)
     parser.add_argument("--signer", default="http://127.0.0.1:8081")
     args = parser.parse_args()
 
-    auth_path = Path(args.auth_json)
-    if not auth_path.is_file():
-        raise SystemExit(f"auth.json 不存在: {auth_path}")
+    if args.auth_json:
+        auth_path = Path(args.auth_json)
+        if not auth_path.is_file():
+            raise SystemExit(f"auth.json 不存在: {auth_path}")
+        auth_user = args.auth_user or "0"
+    else:
+        auth_path, auto_user = _default_auth_path()
+        auth_user = args.auth_user or auto_user
 
     jar = load_cookies(auth_path)
     core, tokens = split(jar)
@@ -223,13 +279,13 @@ async def main() -> None:
             ("application/x-www-form-urlencoded", "A2 直连(form)"),
         ):
             _lbl, _st, rotated = await try_direct(
-                client, jar, args.auth_user, ROTATE_URL_ACCOUNTS, ct, label
+                client, jar, auth_user, ROTATE_URL_ACCOUNTS, ct, label
             )
             if rotated and not best_rotation:
                 best_rotation = rotated
 
         # B: 叠加 proof mint 动态头
-        dyn = await mint_headers(signer_client, args.signer, jar, args.auth_user)
+        dyn = await mint_headers(signer_client, args.signer, jar, auth_user)
         if dyn:
             keep = {
                 k: v
@@ -240,7 +296,7 @@ async def main() -> None:
             _lbl, _st, rotated = await try_direct(
                 client,
                 jar,
-                args.auth_user,
+                auth_user,
                 ROTATE_URL_ACCOUNTS,
                 "application/json+protobuf",
                 "B 直连+proof动态头",
@@ -255,7 +311,7 @@ async def main() -> None:
         _lbl, _st, rotated = await try_direct(
             client,
             jar,
-            args.auth_user,
+            auth_user,
             ROTATE_URL_MAKERSUITE,
             "application/json+protobuf",
             "C MakerSuite域rotate",
@@ -265,19 +321,19 @@ async def main() -> None:
 
         # D: signer 指纹栈
         rotated = await try_via_signer(
-            signer_client, args.signer, jar, args.auth_user
+            signer_client, args.signer, jar, auth_user
         )
         if rotated and not best_rotation:
             best_rotation = rotated
 
         # 判定探测
         print()
-        t1 = await tier_call(client, jar, args.auth_user)
+        t1 = await tier_call(client, jar, auth_user)
         print(f"{'T1 旧Cookie全套':34s} → HTTP {t1}")
         if best_rotation:
-            t2 = await tier_call(client, {**core, **best_rotation}, args.auth_user)
+            t2 = await tier_call(client, {**core, **best_rotation}, auth_user)
             print(f"{'T2 核心+新令牌':34s} → HTTP {t2}")
-        t3 = await tier_call(client, core, args.auth_user)
+        t3 = await tier_call(client, core, auth_user)
         print(f"{'T3 仅核心Cookie':34s} → HTTP {t3}")
 
     print()
