@@ -699,7 +699,9 @@ async def test_route_conversion_error_has_openai_shape(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_route_stream_first_event_error_returns_http_status(monkeypatch):
+async def test_route_stream_immediate_headers_error_in_band(monkeypatch):
+    """响应头必须立即返回(防 CF 524):早期错误改为流内 SSE 错误事件。"""
+
     async def failing_stream(**_kwargs: Any):
         raise RuntimeError("upstream exploded")
         yield  # pragma: no cover
@@ -720,10 +722,14 @@ async def test_route_stream_first_event_error_returns_http_status(monkeypatch):
         },
     )
 
-    assert response.status_code == 500
-    error = _as_dict(_as_dict(response.json())["error"])
-    assert error["type"] == "api_error"
-    assert "upstream exploded" in error["message"]
+    # 立即 200 + text/event-stream;错误在流内以 SSE data 事件呈现
+    assert response.status_code == 200
+    assert "text/event-stream" in response.headers.get("content-type", "")
+    body = response.text
+    assert body.startswith("data: ")
+    assert '"error"' in body
+    assert "api_error" in body
+    assert "upstream exploded" in body
 
 
 @pytest.mark.asyncio

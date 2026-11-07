@@ -105,29 +105,13 @@ async def chat_completions(
             client=client,
             api_format="openai",
         )
-        try:
-            first_event = await iterator.__anext__()
-        except StopAsyncIteration:
-            return format_error_response(
-                HTTPException(
-                    500,
-                    detail={
-                        "message": "generation produced no stream events",
-                        "type": "server_error",
-                    },
-                ),
-                "openai",
-            )
-        except Exception as exc:
-            return format_error_response(exc, "openai")
-
         renderer = OpenAIStreamRenderer(model_path)
 
+        # 立即返回响应头,不再预拉首事件:Cloudflare 对"源站 100s 未返回
+        # 响应头"直接 524(ATG 静默/空响应重试/切号期间首事件可能 >100s)。
+        # 代价是早期错误改为流内 SSE 错误事件(与 Gemini 路径行为一致)。
         async def rendered_chunks() -> AsyncIterator[str]:
             try:
-                chunk = renderer.render(first_event)
-                if chunk:
-                    yield chunk
                 async for event in iterator:
                     rendered = renderer.render(event)
                     if rendered:
@@ -135,6 +119,8 @@ async def chat_completions(
                 tail = renderer.close()
                 if tail:
                     yield tail
+            except StopAsyncIteration:
+                return
             except Exception as exc:
                 yield openai_sse_error(exc)
 
