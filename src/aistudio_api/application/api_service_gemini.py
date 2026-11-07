@@ -212,7 +212,7 @@ def _build_gemini_streaming_response(
     req: GeminiGenerateContentRequest,
     model_path: str,
 ) -> StreamingResponse:
-    async def stream_response():
+    async def sse_chunks():
         try:
             async for event in stream_generation(
                 model_path=model_path,
@@ -240,6 +240,14 @@ def _build_gemini_streaming_response(
         except Exception as exc:
             logger.warning("流式生成异常: model=%s, error=%s", model_path, exc)
             yield format_sse_error(exc)
+
+    # 心跳保活:静默超过 15s 输出 SSE 注释行,防止网关空闲超时 504
+    # (ATG 合成通道首段内容出现前常有长静默)
+    async def stream_response():
+        from aistudio_api.api.sse_heartbeat import heartbeat_sse
+
+        async for chunk in heartbeat_sse(sse_chunks()):
+            yield chunk
 
     return StreamingResponse(
         stream_response(),

@@ -123,7 +123,7 @@ async def chat_completions(
 
         renderer = OpenAIStreamRenderer(model_path)
 
-        async def event_stream() -> AsyncIterator[str]:
+        async def rendered_chunks() -> AsyncIterator[str]:
             try:
                 chunk = renderer.render(first_event)
                 if chunk:
@@ -137,6 +137,14 @@ async def chat_completions(
                     yield tail
             except Exception as exc:
                 yield openai_sse_error(exc)
+
+        # 心跳保活:静默超过 15s 输出 SSE 注释行(SSE 规范注释,OpenAI SDK
+        # 会忽略),防止网关空闲超时 504(ATG 合成通道首段内容前常长静默)
+        async def event_stream() -> AsyncIterator[str]:
+            from aistudio_api.api.sse_heartbeat import heartbeat_sse
+
+            async for chunk in heartbeat_sse(rendered_chunks()):
+                yield chunk
 
         return StreamingResponse(
             event_stream(),
