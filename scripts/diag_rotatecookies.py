@@ -3,7 +3,7 @@
 用法(服务器项目目录下,先重启到含 /v1/cookies/rotate 的新版 waa-signer):
     uv run python scripts/diag_rotatecookies.py            # 自动选活跃账号(无则第一个)
     uv run python scripts/diag_rotatecookies.py data/accounts/<账号ID>/auth.json
-    可选: --proxy http://host:port  --signer http://127.0.0.1:8081
+    可选: --proxy http://host:port  --signer http://127.0.0.1:12221(默认 12221)
 
 实验矩阵(每条路径都只打印状态码与 Cookie 名,绝不打印值):
   A1/A2  直连 httpx POST accounts.google.com/RotateCookies
@@ -156,7 +156,7 @@ async def try_direct(
 async def mint_headers(
     signer_client: httpx.AsyncClient, signer_url: str, jar: dict[str, str], auth_user: str
 ) -> dict[str, str]:
-    """从 /v1/proof/mint 取动态协议头(失败返回空)。"""
+    """从 /v1/proof/mint 取动态协议头(失败返回空并打印原因)。"""
     try:
         resp = await signer_client.post(
             f"{signer_url}/v1/proof/mint",
@@ -170,15 +170,29 @@ async def mint_headers(
             },
             timeout=30.0,
         )
-        data = resp.json()
+        try:
+            data = resp.json()
+        except ValueError:
+            print(f"  [mint] HTTP {resp.status_code} 非 JSON 响应(端点不存在?)")
+            return {}
+        if not data.get("ok"):
+            print(
+                f"  [mint] HTTP {resp.status_code} 失败: {str(data.get('error'))[:100]}"
+            )
+            return {}
         raw = data.get("headers") or {}
         return {str(k): str(v) for k, v in raw.items() if isinstance(v, str)}
-    except Exception:
+    except Exception as exc:
+        print(f"  [mint] 连接失败: {str(exc)[:80]}")
         return {}
 
 
 async def try_via_signer(
-    signer_client: httpx.AsyncClient, signer_url: str, jar: dict[str, str], auth_user: str
+    signer_client: httpx.AsyncClient,
+    signer_url: str,
+    jar: dict[str, str],
+    auth_user: str,
+    proxy: str | None = None,
 ) -> dict[str, str]:
     try:
         resp = await signer_client.post(
@@ -187,17 +201,28 @@ async def try_via_signer(
                 "cookies": header(jar),
                 "authUser": int(auth_user),
                 "body": "",
+                **({"proxy": proxy} if proxy else {}),
             },
-            timeout=60.0,
+            timeout=90.0,
         )
-        data = resp.json()
+        try:
+            data = resp.json()
+        except ValueError:
+            print(
+                f"{'D signer指纹栈rotate':34s} → HTTP {resp.status_code} "
+                "非 JSON 响应(旧版 signer 无此端点,需重编译)"
+            )
+            return {}
+        if data.get("ok") is False and data.get("error"):
+            print(f"{'D signer指纹栈rotate':34s} → 失败: {str(data['error'])[:80]}")
+            return {}
         status = data.get("status")
         lines = data.get("set_cookies") or []
         names = parse_set_cookie_names(lines)
         print(f"{'D signer指纹栈rotate':34s} → HTTP {status}  Set-Cookie: {names or '无'}")
         return parse_rotations(lines)
     except Exception as exc:
-        print(f"{'D signer指纹栈rotate':34s} → 不可用({str(exc)[:50]})")
+        print(f"{'D signer指纹栈rotate':34s} → 连接失败({str(exc)[:50]})")
         return {}
 
 
@@ -256,7 +281,7 @@ async def main() -> None:
     parser.add_argument("auth_json", nargs="?", default=None)
     parser.add_argument("--auth-user", default=None)
     parser.add_argument("--proxy", default=None)
-    parser.add_argument("--signer", default="http://127.0.0.1:8081")
+    parser.add_argument("--signer", default="http://127.0.0.1:12221")
     args = parser.parse_args()
 
     if args.auth_json:
@@ -344,7 +369,7 @@ async def main() -> None:
 
         # D: signer 指纹栈
         rotated = await try_via_signer(
-            signer_client, args.signer, jar, auth_user
+            signer_client, args.signer, jar, auth_user, proxy=args.proxy
         )
         if rotated and not best_rotation:
             best_rotation = rotated
