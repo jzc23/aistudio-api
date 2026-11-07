@@ -114,6 +114,12 @@ class StreamingGateway:
         ):
             if event_type == "status" and payload and not status_code:
                 status_code = int(str(payload))
+            elif event_type == "error":
+                # 中途断流(读超时/连接重置等):立即抛出,绝不能静默吞掉——
+                # 否则已收部分数据的流会被当成正常结束,截断回答以 STOP 返回
+                raise TransportError(
+                    f"upstream stream interrupted: {payload or 'unknown error'}"
+                )
             elif event_type == "chunk" and payload:
                 has_received_chunks = True
                 if isinstance(payload, bytes):

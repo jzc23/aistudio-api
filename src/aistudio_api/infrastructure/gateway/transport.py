@@ -6,6 +6,7 @@ using connection pooling and chunk streaming.
 
 from __future__ import annotations
 
+import os
 import time
 from collections.abc import AsyncGenerator
 
@@ -113,9 +114,23 @@ async def _ensure_authorization_header(
 class HTTPStreamTransport:
     """Direct HTTP streaming and non-streaming transport layer."""
 
-    def __init__(self, proxy_url: str | None = None, timeout: float = 120.0) -> None:
+    def __init__(
+        self,
+        proxy_url: str | None = None,
+        timeout: float = 120.0,
+        read_timeout: float | None = None,
+    ) -> None:
         self.proxy_url = proxy_url or settings.proxy_url
         self.timeout = timeout
+        # 上游流式读超时:ATG 合成通道在整篇长文生成期间上游可能长时间不吐
+        # 字节(下游已有 SSE 心跳保活,上游静默是合法状态),默认放宽到 600s,
+        # 可用 AISTUDIO_UPSTREAM_READ_TIMEOUT 环境变量覆盖。
+        if read_timeout is None:
+            try:
+                read_timeout = float(os.environ.get("AISTUDIO_UPSTREAM_READ_TIMEOUT", "600"))
+            except ValueError:
+                read_timeout = 600.0
+        self.read_timeout = read_timeout
         self._client: httpx.AsyncClient | None = None
 
     async def close(self) -> None:
@@ -126,7 +141,9 @@ class HTTPStreamTransport:
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
             self._client = httpx.AsyncClient(
-                timeout=httpx.Timeout(self.timeout, connect=15.0),
+                timeout=httpx.Timeout(
+                    self.timeout, connect=15.0, read=self.read_timeout
+                ),
                 proxy=self.proxy_url,
                 http2=True,
                 limits=httpx.Limits(max_keepalive_connections=20, max_connections=50),
@@ -217,5 +234,11 @@ class HTTPStreamTransport:
                     yield ("chunk", chunk)
 
         except Exception as exc:
-            logger.warning("Streaming request encountered exception: %s", exc)
-            yield ("error", str(exc))
+            # ReadTimeout 等异常的 str 可能为空,带上类名才能定位
+            label = str(exc).strip() or type(exc).__name__
+            logger.warning(
+                "Streaming request encountered exception: %s: %s",
+                type(exc).__name__,
+                exc,
+            )
+            yield ("error", label)

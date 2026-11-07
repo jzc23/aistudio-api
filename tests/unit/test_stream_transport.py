@@ -124,3 +124,40 @@ async def test_streaming_gateway_split_utf8_chunks():
         == "嗨！我是你的酒馆工程搭档。平时在这套工作区里，一起搞的事情挺多的：🎉🚀"
     )
     assert "\ufffd" not in joined
+
+
+@pytest.mark.asyncio
+async def test_streaming_gateway_raises_on_error_event():
+    """中途断流(error 事件)必须抛 TransportError,不得静默吞掉截断的流。"""
+
+    class MockSession:
+        async def send_streaming_request(
+            self, **kwargs: object
+        ) -> AsyncGenerator[tuple[str, object], None]:
+            yield ("status", 200)
+            yield ("chunk", b")]}'\n[[ ")
+            yield ("error", "ReadTimeout")  # 模拟读超时中断
+
+    gateway = StreamingGateway(session=MockSession())  # type: ignore[arg-type]
+    prepared = PreparedRequest(url="https://example.com", headers={}, body="{}")
+    with pytest.raises(TransportError, match="upstream stream interrupted"):
+        async for _event in gateway.stream_chat(
+            request=prepared, model="models/gemini-2.5-flash"
+        ):
+            pass
+
+
+def test_transport_read_timeout_default_and_env(monkeypatch):
+    """上游读超时默认 600s,可用 AISTUDIO_UPSTREAM_READ_TIMEOUT 覆盖。"""
+    monkeypatch.delenv("AISTUDIO_UPSTREAM_READ_TIMEOUT", raising=False)
+    t = HTTPStreamTransport()
+    assert t.read_timeout == 600.0
+
+    monkeypatch.setenv("AISTUDIO_UPSTREAM_READ_TIMEOUT", "1200")
+    t2 = HTTPStreamTransport()
+    assert t2.read_timeout == 1200.0
+
+    # 非法值回退默认
+    monkeypatch.setenv("AISTUDIO_UPSTREAM_READ_TIMEOUT", "abc")
+    t3 = HTTPStreamTransport()
+    assert t3.read_timeout == 600.0
