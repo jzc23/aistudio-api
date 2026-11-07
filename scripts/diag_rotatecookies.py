@@ -83,6 +83,12 @@ def parse_set_cookie_names(lines: list[str]) -> list[str]:
 
 
 def parse_rotations(lines: list[str]) -> dict[str, str]:
+    """解析 Set-Cookie 为 name→value;过滤属性名假 Cookie(priority/samesite 等)。"""
+    # SimpleCookie 会把 cookie 属性误解析成同名 cookie,这里显式排除
+    attr_names = {
+        "priority", "samesite", "path", "domain", "expires", "max-age",
+        "secure", "httponly", "partitioned", "version", "comment",
+    }
     rotated: dict[str, str] = {}
     for line in lines:
         c = SimpleCookie()
@@ -91,7 +97,7 @@ def parse_rotations(lines: list[str]) -> dict[str, str]:
         except Exception:
             continue
         for k in c:
-            if c[k].value:
+            if k and k.lower() not in attr_names and c[k].value:
                 rotated[k] = c[k].value
     return rotated
 
@@ -273,6 +279,23 @@ async def main() -> None:
     ) as client, httpx.AsyncClient(
         timeout=60.0, trust_env=False
     ) as signer_client:
+        # signer 版本自检:/v1/cookies/rotate 不存在(404)说明还是旧二进制
+        try:
+            probe = await signer_client.post(
+                f"{args.signer}/v1/cookies/rotate",
+                json={"cookies": "SID=probe"},
+                timeout=10.0,
+            )
+            if probe.status_code == 404:
+                print("⚠ signer 是旧版本(无 /v1/cookies/rotate),D 路径将不可用。")
+                print("  请重编译: cd waa-signer && bash build.sh && sudo systemctl restart waa-signer")
+                print()
+            elif probe.status_code == 400:
+                print("✓ signer 已含 /v1/cookies/rotate 端点(400=缺参数,符合预期)")
+                print()
+        except Exception as exc:
+            print(f"⚠ signer 探测失败({str(exc)[:60]}),B/D 路径可能不可用")
+            print()
         # A: 直连两变体
         for ct, label in (
             ("application/json+protobuf", "A1 直连(json+protobuf)"),
@@ -331,17 +354,27 @@ async def main() -> None:
         t1 = await tier_call(client, jar, auth_user)
         print(f"{'T1 旧Cookie全套':34s} → HTTP {t1}")
         if best_rotation:
-            t2 = await tier_call(client, {**core, **best_rotation}, auth_user)
-            print(f"{'T2 核心+新令牌':34s} → HTTP {t2}")
+            # T2(合并模式): 旧全套 + 新令牌覆盖同名项 ——
+            # 保留旧 PSIDTS 等,只叠加轮转返回的新值,才能单独验证新令牌有效性
+            t2 = await tier_call(client, {**jar, **best_rotation}, auth_user)
+            print(f"{'T2 旧全套+新令牌(合并)':34s} → HTTP {t2}")
+            # T2b: 若轮转返回了 PSIDTS,再用「核心+新PSIDTS」验证其独立可用性
+            new_ts = {k: v for k, v in best_rotation.items() if "PSIDTS" in k}
+            if new_ts:
+                t2b = await tier_call(client, {**core, **new_ts}, auth_user)
+                print(f"{'T2b 核心+新PSIDTS':34s} → HTTP {t2b}")
         t3 = await tier_call(client, core, auth_user)
-        print(f"{'T3 仅核心Cookie':34s} → HTTP {t3}")
+        print(f"{'T3 仅核心Cookie(无PSIDTS)':34s} → HTTP {t3}")
 
     print()
     print("==== 判定 ====")
     if best_rotation:
         print(f"轮转成功路径返回令牌: {sorted(best_rotation)}")
         print(f"- T1={t1}: {'旧令牌仍有效(风险低)' if t1 == 200 else '旧令牌被即时作废(必须原子切换)'}")
-        print(f"- T3={t3}: {'剥离 PSIDTS 路线可行(兜底)' if t3 == 200 else '核心凭据疑似失效,请重新导入'}")
+        if t3 == 200:
+            print(f"- T3={t3}: 剥离 PSIDTS 路线可行(兜底)")
+        else:
+            print(f"- T3={t3}: 该账号 RPC 探测无 PSIDTS 即 401(剥离路线对 RPC 不成立)")
     else:
         print("所有路径均未拿到新令牌 —— 阶段0判定:需依赖 signer 路径(D)或方案终止")
         print(f"- T1={t1}, T3={t3}(当前凭据状态参考)")
