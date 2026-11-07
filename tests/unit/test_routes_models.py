@@ -130,6 +130,55 @@ async def test_model_discovery_falls_back_to_auth_file_cookies(tmp_path, monkeyp
 
 
 @pytest.mark.asyncio
+async def test_model_discovery_probes_with_highest_tier_account(
+    tmp_path, monkeypatch
+):
+    """列表探测应使用池内最高订阅等级账号的凭据,而非当前活跃账号。
+
+    场景:活跃账号是 Free(看不到 gemini-4-argon),池内另有一个 Ultra 账号
+    → 探测必须用 Ultra 的凭据,才能拉到含付费模型的全量目录。
+    """
+    from unittest.mock import AsyncMock
+
+    from aistudio_api.infrastructure.account.account_store import AccountStore
+    from aistudio_api.infrastructure.gateway.model_discovery import (
+        ModelDiscoveryService,
+    )
+
+    monkeypatch.setenv("AISTUDIO_ACCOUNTS_DIR", str(tmp_path))
+    store = AccountStore(tmp_path)
+    # 先导入 Free 账号(会成为活跃账号),再导入 Ultra 账号
+    store.save_account(
+        name="free-active",
+        email="free@example.com",
+        storage_state={"cookies": [{"name": "SAPISID", "value": "sap-free"}]},
+        auth_user="0",
+    )
+    store.save_account(
+        name="ultra-idle",
+        email="ultra@example.com",
+        storage_state={"cookies": [{"name": "SAPISID", "value": "sap-ultra"}]},
+        auth_user="1",
+        tier="Ultra",
+    )
+    store.set_active_account(store.list_accounts()[0].id)
+    assert store.get_active_account().tier == "Free"
+
+    service = ModelDiscoveryService()
+    service._fetch_via_http = AsyncMock(
+        return_value=[{"id": "gemini-4-argon", "displayName": "Argon"}]
+    )
+
+    models = await service.get_models(force_refresh=True)
+    assert models[0]["id"] == "gemini-4-argon"
+    call_cookies, call_auth_user = service._fetch_via_http.call_args[0]
+    call_tier = service._fetch_via_http.call_args.kwargs.get("tier", "Free")
+    assert call_cookies["SAPISID"] == "sap-ultra"
+    assert call_auth_user == "1"
+    assert call_tier == "Ultra"
+
+
+@pytest.mark.asyncio
 async def test_model_discovery_extended_fields_and_aliases():
     """Verify ListModels parses version, temperature, topP, topK, aliases, capabilities, and accessModes."""
     from aistudio_api.api.routes_models import _to_gemini_model

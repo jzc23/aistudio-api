@@ -80,8 +80,28 @@ def _extract_model_aliases(raw: object) -> list[str]:
     return aliases
 
 
+# 订阅等级排序权重:数值越大权限越高,列表探测按此挑"最高权限"账号
+_TIER_RANKS = {
+    "Free": 0,
+    "Plus": 1,
+    "Pro": 2,
+    "Ultra": 3,
+    "Ultra_20X": 4,
+    "Ultra 20X": 4,
+}
+
+
+def _tier_rank(tier: str | None) -> int:
+    return _TIER_RANKS.get(str(tier or "Free").strip(), 0)
+
+
 # 本地保底默认模型列表（当网络未就绪或未配置账号时使用）
 _FALLBACK_MODELS = [
+    {
+        "id": "gemini-4-argon",
+        "displayName": "Gemini 4 Argon",
+        "description": "Flagship Gemini 4 reasoning model (paid tiers)",
+    },
     {
         "id": "gemini-3.8-flash",
         "displayName": "Gemini 3.8 Flash",
@@ -200,6 +220,33 @@ class ModelDiscoveryService:
                     if session is not None
                     else None
                 )
+                # 列表探测优先用池内"最高订阅等级"的账号凭据:
+                # Google ListModels 返回按账号等级个性化的目录(Free 看不到
+                # gemini-4-argon 等付费模型),用最高权限视角才能拉到全量目录,
+                # 避免轮换到低等级账号时列表"丢"付费模型。
+                try:
+                    from aistudio_api.infrastructure.account.account_store import (
+                        AccountStore,
+                    )
+
+                    _store = AccountStore()
+                    _enabled = [a for a in _store.list_accounts() if a.enabled]
+                    if _enabled:
+                        _probe = max(
+                            _enabled,
+                            key=lambda a: _tier_rank(getattr(a, "tier", "Free")),
+                        )
+                        _probe_path = _store.get_auth_path_optional(
+                            _probe.id, require_exists=True
+                        )
+                        if _probe_path:
+                            auth_file = str(_probe_path)
+                            effective_auth_user = _probe.auth_user or "0"
+                            effective_tier = (
+                                getattr(_probe, "tier", "Free") or "Free"
+                            )
+                except Exception:
+                    pass
                 if not auth_file:
                     try:
                         from aistudio_api.infrastructure.account.account_store import (
