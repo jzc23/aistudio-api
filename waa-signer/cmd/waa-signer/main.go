@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -577,6 +578,84 @@ func main() {
 				break
 			}
 		}
+	})
+
+	// POST /v1/cookies/rotate: 经同一 SpiderMonkey Worker 的 Firefox 152 uTLS
+	// 连接池调用 Google RotateCookies,返回响应 Set-Cookie(令牌轮转实验用)。
+	// 与 /v1/rpc/send 的区别:本端点会收集并回传响应头里的 Set-Cookie,
+	// 而不是只透传 body —— RotateCookies 的全部产出就是这些响应头。
+	mux.HandleFunc("POST /v1/cookies/rotate", func(w http.ResponseWriter, r *http.Request) {
+		var req SendRPCRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "invalid JSON body: " + err.Error()})
+			return
+		}
+		if strings.TrimSpace(req.Cookies) == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "cookies are required"})
+			return
+		}
+		targetURL := strings.TrimSpace(req.URL)
+		if targetURL == "" {
+			targetURL = "https://accounts.google.com/RotateCookies"
+		}
+		authUser := parseAuthUser(req.AuthUser)
+
+		worker, _, err := pool.AcquireWorker(r.Context(), req.Cookies, authUser, req.Model, req.Proxy, false)
+		if err != nil {
+			writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+
+		protoHeaders, err := worker.ProtocolHeaders(r.Context(), "")
+		if err != nil {
+			writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		state, err := worker.BrowserStorageState(r.Context())
+		if err != nil {
+			writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		authHeader, err := aistudio.NewSigner().Authorization(state)
+		if err != nil {
+			writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+
+		hdrs := protoHeaders.Clone()
+		hdrs.Set("Content-Type", "application/json+protobuf")
+		hdrs.Set("Authorization", authHeader)
+		for k, v := range req.Headers {
+			if strings.EqualFold(k, "host") || strings.EqualFold(k, "content-length") || strings.EqualFold(k, "cookie") {
+				continue
+			}
+			hdrs.Set(k, v)
+		}
+
+		resp, err := worker.SendProtected(r.Context(), aistudio.ProtectedRequest{
+			URL:        targetURL,
+			Headers:    hdrs,
+			Body:       []byte(req.Body),
+			PagePrompt: req.PagePrompt,
+		})
+		if err != nil {
+			writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		defer resp.Body.Close()
+		_, _ = io.Copy(io.Discard, resp.Body)
+
+		setCookies := resp.Header.Values("Set-Cookie")
+		result := map[string]any{
+			"ok":          len(setCookies) > 0,
+			"status":      resp.StatusCode,
+			"set_cookies": setCookies,
+		}
+		// 轮转后导出 Worker 内部 Cookie jar 增量视角(含新令牌)
+		if after, err := worker.BrowserStorageState(r.Context()); err == nil {
+			result["storage_state"] = after
+		}
+		writeJSON(w, http.StatusOK, result)
 	})
 
 	server := &http.Server{
