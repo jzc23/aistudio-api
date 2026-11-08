@@ -127,6 +127,22 @@ class Auth403RetryManager:
         # 2. 后 2 次 403: 重新向签名服务生成新快照 (Re-sign 1/2, 2/2)
         if self.count <= 4:
             self.current_prepared = None
+            # 第 3 次 403: 先尝试轮换当前账号 Cookie 再重签(上游 722b84c 语义)
+            if self.count == 3:
+                account_svc = runtime_state.account_service
+                active_acc = account_svc.get_active_account() if account_svc else None
+                if (
+                    account_svc is not None
+                    and active_acc is not None
+                    and hasattr(account_svc, "rotate_account_cookies")
+                ):
+                    try:
+                        session = getattr(client, "session", None)
+                        await account_svc.rotate_account_cookies(
+                            active_acc.id, session
+                        )
+                    except Exception:
+                        pass
             logger.warning(
                 "遭遇 403 权限异常，重放未恢复，执行第 %d/2 次重新签名 (Re-sign): model=%s",
                 self.count - 2,
