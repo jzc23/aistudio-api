@@ -15,6 +15,7 @@ import type {
   SignerServersResponse,
   TestSignerServerResponse,
 } from '@/types'
+import type { SystemConfigDefaults } from '@/components/config/types.ts'
 
 
 export const systemApi = {
@@ -51,6 +52,10 @@ export const systemApi = {
 
   getConfig(): Promise<SystemConfig> {
     return request<SystemConfig>('/config')
+  },
+
+  getConfigDefaults(): Promise<SystemConfigDefaults> {
+    return request<SystemConfigDefaults>('/config/defaults')
   },
 
   updateConfigYaml(yamlContent: string): Promise<{ ok: boolean; message: string }> {
