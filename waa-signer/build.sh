@@ -111,10 +111,16 @@ fi
 
 # 检查编译器
 if command -v zig >/dev/null 2>&1; then
+  # zig 用 aarch64/x86_64 命名,Go 用 arm64/amd64 —— 必须转换
+  case "$GO_ARCH" in
+    amd64) ZIG_ARCH="x86_64" ;;
+    arm64) ZIG_ARCH="aarch64" ;;
+    *)     ZIG_ARCH="$GO_ARCH" ;;
+  esac
   case "$TARGET_GOOS" in
-    linux)   ZIG_TARGET="${GO_ARCH}-linux-musl" ;;
-    darwin)  ZIG_TARGET="${GO_ARCH}-macos-none" ;;
-    windows) ZIG_TARGET="${GO_ARCH}-windows-gnu" ;;
+    linux)   ZIG_TARGET="${ZIG_ARCH}-linux-musl" ;;
+    darwin)  ZIG_TARGET="${ZIG_ARCH}-macos-none" ;;
+    windows) ZIG_TARGET="${ZIG_ARCH}-windows-gnu" ;;
   esac
   CC_CMD="zig cc -target ${ZIG_TARGET}"
   CXX_CMD="zig c++ -target ${ZIG_TARGET}"
