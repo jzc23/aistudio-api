@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import itertools
 import time
@@ -9,13 +10,18 @@ from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
 
 from aistudio_api.config import settings
+from aistudio_api.domain.errors import StaleSessionError
 from aistudio_api.infrastructure.account.cookie_parser import (
     ROTATING_SESSION_COOKIE_NAMES,
     build_makersuite_headers,
     get_auth_user_from_meta,
+    get_cookie_id_from_meta,
     get_tier_from_meta,
     load_cookies_from_auth_file,
     parse_raw_cookies,
+)
+from aistudio_api.infrastructure.gateway.headers import (
+    merge_header_case_insensitive,
 )
 from aistudio_api.infrastructure.gateway.transport import HTTPStreamTransport
 from aistudio_api.infrastructure.gateway.wire_types import AistudioContent
@@ -33,6 +39,7 @@ class SessionContext:
     auth_file: str | None = None
     tier: str = "Free"
     cookies: dict[str, str] = field(default_factory=dict)
+    cookie_id: str = ""
     context_id: int = field(default_factory=itertools.count(1).__next__)
     created_at: float = field(default_factory=time.time)
 
@@ -53,6 +60,7 @@ class GatewaySession:
         self._auth_user: str | None = None
         self._tier: str | None = None
         self._active_context: SessionContext | None = None
+        self._signing_locks: dict[str, asyncio.Lock] = {}
         self._transport = HTTPStreamTransport(proxy_url=settings.proxy_url)
         from aistudio_api.infrastructure.gateway.model_defaults import (
             get_active_waa_server,
@@ -72,6 +80,12 @@ class GatewaySession:
     @property
     def active_context(self) -> SessionContext | None:
         return self._active_context
+
+    def is_context_current(self, context: SessionContext) -> bool:
+        """凭据代际变化后，旧快照不得再次进入签名服务或回写。"""
+        return not context.auth_file or (
+            get_cookie_id_from_meta(context.auth_file) == context.cookie_id
+        )
 
     @property
     def last_signer_headers(self) -> dict[str, str]:
@@ -136,6 +150,7 @@ class GatewaySession:
             auth_file=auth_file,
             tier=target_tier,
             cookies=cookies,
+            cookie_id=get_cookie_id_from_meta(auth_file),
         )
         self._active_context = new_context
         log.info(
@@ -151,9 +166,35 @@ class GatewaySession:
         contents: list[AistudioContent],
         ctx: SessionContext | None = None,
         model: str = "models/gemini-3.7-flash",
+        force_recreate: bool = False,
     ) -> str:
-        """Generate fresh WAA proof token for request contents."""
+        """同一账号串行签名，防止迟到的旧凭据重建并回滚新 Worker。"""
         active_ctx = ctx or await self.ensure_ready()
+        key = active_ctx.auth_file or f"auth-user:{active_ctx.auth_user}"
+        lock = self._signing_locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            if not self.is_context_current(active_ctx):
+                raise StaleSessionError("签名快照已被新导入凭据替换")
+            try:
+                proof = await self._generate_snapshot_current(
+                    contents, active_ctx, model, force_recreate=force_recreate
+                )
+            except Exception as exc:
+                if not self.is_context_current(active_ctx):
+                    raise StaleSessionError("旧代际签名失败，凭据已更新") from exc
+                raise
+            if not self.is_context_current(active_ctx):
+                raise StaleSessionError("签名期间凭据已更新，请重新准备请求")
+            return proof
+
+    async def _generate_snapshot_current(
+        self,
+        contents: list[AistudioContent],
+        active_ctx: SessionContext,
+        model: str,
+        force_recreate: bool = False,
+    ) -> str:
+        """仅供已持有账号签名锁的当前代际调用。"""
         from aistudio_api.infrastructure.gateway.model_defaults import (
             get_active_waa_server,
         )
@@ -169,24 +210,43 @@ class GatewaySession:
                     await res
             remote.server_url = target_url
 
-        if not active_ctx.cookies and active_ctx.auth_file:
-            active_ctx.cookies = load_cookies_from_auth_file(active_ctx.auth_file)
+        if not self.is_context_current(active_ctx):
+            raise StaleSessionError("签名前凭据代际已更新")
+        if active_ctx.auth_file:
+            disk_cookies = load_cookies_from_auth_file(active_ctx.auth_file)
+            if disk_cookies:
+                active_ctx.cookies.update(disk_cookies)
         cookies = active_ctx.cookies
         auth_user = active_ctx.auth_user or "0"
         tier = active_ctx.tier or "Free"
 
-        proof = await self._signer.generate_snapshot(
-            contents=contents,
-            cookies=cookies,
-            auth_user=auth_user,
-            tier=tier,
-            model=model,
-        )
+        if force_recreate:
+            proof = await self._signer.generate_snapshot(
+                contents=contents,
+                cookies=cookies,
+                auth_user=auth_user,
+                tier=tier,
+                model=model,
+                force_recreate=True,
+            )
+        else:
+            proof = await self._signer.generate_snapshot(
+                contents=contents,
+                cookies=cookies,
+                auth_user=auth_user,
+                tier=tier,
+                model=model,
+            )
         self._sync_signer_cookies(active_ctx)
         return proof
 
     def _sync_signer_cookies(self, active_ctx: SessionContext) -> None:
-        """当 WAA 签名服务在内部刷新了滚动 Cookie 时，将其同步回 SessionContext 与 AccountStore。"""
+        """仅当 WAA 签名服务冷启动 (cold) 访问官网产生新 SIDCC 时同步回本地；严禁热复用 (hot) 用旧 PSIDTS 反向覆盖。"""
+        if not self.is_context_current(active_ctx):
+            return
+        pool_state = getattr(self._signer, "last_pool_state", None)
+        if pool_state == "hot":
+            return
         dyn_headers = getattr(self._signer, "last_headers", None)
         if not isinstance(dyn_headers, dict):
             return
@@ -196,8 +256,13 @@ class GatewaySession:
         parsed = parse_raw_cookies(raw_cookie)
         if not parsed:
             return
+        sync_names = (
+            ("SIDCC", "__Secure-1PSIDCC", "__Secure-3PSIDCC")
+            if pool_state == "cold"
+            else ROTATING_SESSION_COOKIE_NAMES
+        )
         changed = False
-        for k in ROTATING_SESSION_COOKIE_NAMES:
+        for k in sync_names:
             val = parsed.get(k)
             if val and active_ctx.cookies.get(k) != val:
                 active_ctx.cookies[k] = val
@@ -211,6 +276,7 @@ class GatewaySession:
                 AccountStore().update_account_cookies(
                     auth_file=active_ctx.auth_file,
                     new_cookies=active_ctx.cookies,
+                    expected_cookie_id=active_ctx.cookie_id,
                 )
             except Exception as e:
                 log.debug("回写签名服务 Cookie 失败: %s", e)
@@ -220,14 +286,29 @@ class GatewaySession:
         contents: list[AistudioContent],
         ctx: SessionContext | None = None,
         model: str = "models/gemini-3.7-flash",
+        force_recreate: bool = False,
     ) -> tuple[str, dict[str, str]]:
         """Generate fresh WAA proof token and dynamic session headers."""
         proof = await self.generate_snapshot(
             contents=contents,
             ctx=ctx,
             model=model,
+            force_recreate=force_recreate,
         )
         return proof, dict(self.last_signer_headers)
+
+    @staticmethod
+    def build_request_headers(
+        headers: dict[str, str] | None, auth_user: str
+    ) -> dict[str, str]:
+        """合并默认上游头、鉴权用户与调用方覆盖头，全程大小写不敏感去重。"""
+        merged: dict[str, str] = {}
+        for name, value in DEFAULT_UPSTREAM_HEADERS.items():
+            merge_header_case_insensitive(merged, str(name), str(value))
+        merge_header_case_insensitive(merged, "X-Goog-AuthUser", str(auth_user or "0"))
+        for name, value in (headers or {}).items():
+            merge_header_case_insensitive(merged, str(name), str(value))
+        return merged
 
     async def send_request(
         self,
@@ -241,10 +322,9 @@ class GatewaySession:
             ctx if isinstance(ctx, SessionContext) else await self.ensure_ready()
         )
         target_url = url or GENERATE_CONTENT_URL
-        req_headers = dict(DEFAULT_UPSTREAM_HEADERS)
-        req_headers["X-Goog-AuthUser"] = active_ctx.auth_user
-        if headers:
-            req_headers.update(headers)
+        req_headers = self.build_request_headers(
+            headers, auth_user=active_ctx.auth_user
+        )
         return await self._transport.send_request(
             url=target_url,
             headers=req_headers,
@@ -253,6 +333,7 @@ class GatewaySession:
             tier=active_ctx.tier,
             auth_file=active_ctx.auth_file,
             cookies=active_ctx.cookies,
+            expected_cookie_id=active_ctx.cookie_id,
         )
 
     async def send_streaming_request(
@@ -267,10 +348,9 @@ class GatewaySession:
             ctx if isinstance(ctx, SessionContext) else await self.ensure_ready()
         )
         target_url = url or GENERATE_CONTENT_URL
-        req_headers = dict(DEFAULT_UPSTREAM_HEADERS)
-        req_headers["X-Goog-AuthUser"] = active_ctx.auth_user
-        if headers:
-            req_headers.update(headers)
+        req_headers = self.build_request_headers(
+            headers, auth_user=active_ctx.auth_user
+        )
         async for event in self._transport.send_streaming_request(
             url=target_url,
             headers=req_headers,
@@ -279,6 +359,7 @@ class GatewaySession:
             tier=active_ctx.tier,
             auth_file=active_ctx.auth_file,
             cookies=active_ctx.cookies,
+            expected_cookie_id=active_ctx.cookie_id,
         ):
             yield event
 

@@ -356,7 +356,10 @@ def _default_config() -> dict[str, object]:
                 },
                 {
                     "name": "video_models",
-                    "match": {"prefixes": ["veo-"], "contains": ["veo"]},
+                    "match": {
+                        "prefixes": ["veo-"],
+                        "contains": ["veo", "omni", "video"],
+                    },
                     "disable_safety_settings": True,
                 },
                 {
@@ -404,7 +407,7 @@ def _default_config() -> dict[str, object]:
         },
         "paid_model_rules": {
             "ultra_required": {
-                "contains": ["veo", "ultra"],
+                "contains": ["veo", "ultra", "omni"],
                 "required_tiers": ["Ultra", "Ultra_20X"],
             },
             "pro_required": {

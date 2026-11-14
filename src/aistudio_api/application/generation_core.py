@@ -35,6 +35,7 @@ from aistudio_api.domain.errors import (
     AuthError,
     RequestError,
     SessionExpiredError,
+    StaleSessionError,
     TransportError,
     UsageLimitExceeded,
     is_transient_rpc_error,
@@ -90,13 +91,48 @@ AUTH_403_MAX_RETRIES = (
 )
 
 
+# 分钟级短冷却阈值:冷却时长不超过该值视为瞬时 RPM 限流,而非今日配额耗尽
+# (上游 19fe769 / Issue #16)
+SHORT_RATE_LIMIT_COOLDOWN_SECONDS = 600
+
+
+def is_daily_quota_message(message: str) -> bool:
+    """判断上游清理后的错误消息是否明确指向"日配额耗尽"。"""
+    lowered = (message or "").casefold()
+    return any(
+        marker in lowered for marker in ("daily", "per day", "per_day", "perday")
+    )
+
+
+def active_account_cooldown_remaining(account_id: str | None, model: str) -> float:
+    """查询账号在目标模型上的剩余冷却秒数,用于区分瞬时 RPM 限流与日配额耗尽。"""
+    if not account_id:
+        return 0.0
+    rotator = runtime_state.rotator
+    if rotator is None:
+        return 0.0
+    try:
+        stats = rotator.get_account_stats(account_id)
+        if stats is None:
+            return 0.0
+        return float(stats.get_cooldown_remaining(model))
+    except Exception:
+        return 0.0
+
+
 class Auth403RetryManager:
-    """403 阶梯重试管理器：前 2 次重放，后 2 次重新签名，最后 1 次切号。"""
+    """403 阶梯重试管理器：前 2 次重放，后 2 次重新签名，最后 1 次切号。
+
+    force_recreate_signer 用于通知本地/远程签名服务销毁僵死热 Worker 冷重建
+    (上游 19fe769 语义):第 3 次(重签)与第 5 次(切号)置位,由调用方在
+    下一次请求中消费后立即归零,避免重复触发昂贵的冷启动。
+    """
 
     def __init__(self, max_retries: int = AUTH_403_MAX_RETRIES) -> None:
         self.count: int = 0
         self.max_retries: int = max_retries
         self.current_prepared: PreparedRequest | None = None
+        self.force_recreate_signer: bool = False
 
     async def handle_403(
         self,
@@ -117,6 +153,7 @@ class Auth403RetryManager:
         # 1. 前 2 次 403: 重放原有已签名报文 (Replay 1/2, 2/2)
         if self.count <= 2:
             self.current_prepared = client.last_prepared_request
+            self.force_recreate_signer = False
             logger.warning(
                 "遭遇 403 权限异常，执行第 %d/2 次请求重放 (Replay): model=%s",
                 self.count,
@@ -127,6 +164,7 @@ class Auth403RetryManager:
         # 2. 后 2 次 403: 重新向签名服务生成新快照 (Re-sign 1/2, 2/2)
         if self.count <= 4:
             self.current_prepared = None
+            self.force_recreate_signer = self.count == 3
             # 第 3 次 403: 先尝试轮换当前账号 Cookie 再重签(上游 722b84c 语义)
             if self.count == 3:
                 account_svc = runtime_state.account_service
@@ -153,6 +191,7 @@ class Auth403RetryManager:
         # 3. 最后 1 次 403: 切号故障转移 (Failover switch account)
         if self.count == 5:
             self.current_prepared = None
+            self.force_recreate_signer = True
             account_svc = runtime_state.account_service
             active_acc = account_svc.get_active_account() if account_svc else None
             failed_id = active_acc.id if active_acc else None
@@ -297,6 +336,16 @@ async def handle_attempt_exception(
     active_acc = account_svc.get_active_account() if account_svc else None
     failed_id = active_acc.id if active_acc else None
 
+    # Cookie 代际更新(重新导入/轮转)导致的陈旧签名:未出数据直接重备请求,
+    # 已出数据只能中断(上游 62cb23b 语义)
+    if isinstance(exc, StaleSessionError):
+        if not has_yielded_data:
+            logger.info("请求凭据代际已更新，重新准备请求: model=%s", target_model)
+            return True
+        raise HTTPException(
+            503, detail="Request credentials were replaced."
+        ) from exc
+
     if isinstance(exc, ValueError):
         raise HTTPException(
             400, detail={"message": str(exc), "type": "bad_request"}
@@ -340,13 +389,40 @@ async def handle_attempt_exception(
                 target_model,
             )
             return True
-        logger.warning("所有账号在模型 %s 上均处于冷却状态", target_model)
+        # 区分瞬时 RPM 限流与今日配额耗尽(上游 19fe769 / Issue #16):
+        # 冷却剩余较短或上游消息明示 per-day 才报"日配额",否则报短时限流
+        upstream_detail = clean_upstream_error_message(str(exc))
+        cooldown_remaining = active_account_cooldown_remaining(
+            failed_id, target_model
+        )
+        is_daily_quota = (
+            is_daily_quota_message(upstream_detail)
+            or cooldown_remaining > SHORT_RATE_LIMIT_COOLDOWN_SECONDS
+        )
+        if is_daily_quota:
+            message = (
+                f"All accounts reached daily quota for model '{target_model}'. "
+                "Quota resets at 00:00 PST."
+            )
+        else:
+            retry_hint = (
+                f"retry after ~{int(cooldown_remaining)}s"
+                if cooldown_remaining > 0
+                else "retry shortly"
+            )
+            message = (
+                f"Rate limit exceeded (HTTP 429, {retry_hint}): "
+                f"{upstream_detail or 'upstream quota exhausted'}"
+            )
+        logger.warning(
+            "模型 %s 所有账号均在冷却中 (cooldown_remaining=%ds, daily_quota=%s)",
+            target_model,
+            int(cooldown_remaining),
+            is_daily_quota,
+        )
         raise HTTPException(
             429,
-            detail={
-                "message": f"All accounts reached daily quota for model '{target_model}'. Quota resets at 00:00 PST.",
-                "type": "rate_limit_exceeded",
-            },
+            detail={"message": message, "type": "rate_limit_exceeded"},
         ) from exc
 
     if (
@@ -527,7 +603,9 @@ async def generate(
                     max_tokens=normalized.max_tokens,
                     generation_config_overrides=normalized.generation_config_overrides,
                     prepared=auth_manager.current_prepared,
+                    force_recreate_signer=auth_manager.force_recreate_signer,
                 )
+                auth_manager.force_recreate_signer = False
                 auth_manager.current_prepared = None
                 if not (atg.enabled and tool_name):
                     break
@@ -674,7 +752,9 @@ async def stream_generation(
                     max_tokens=normalized.max_tokens,
                     generation_config_overrides=normalized.generation_config_overrides,
                     prepared=auth_manager.current_prepared,
+                    force_recreate_signer=auth_manager.force_recreate_signer,
                 ):
+                    auth_manager.force_recreate_signer = False
                     if event_type == "usage":
                         final_usage = text if isinstance(text, dict) else None
                     elif event_type == "finish_reason":
@@ -744,7 +824,10 @@ async def stream_generation(
                             response_id=latest_response_id,
                             thought_signature=buffered_thought_sig,
                         )
-                        buffered_thought_sig = None
+                        # 仅有实际载荷的事件才消费签名缓冲;"done"/None 载荷
+                        # 事件不能清空,否则尾随独立签名丢失(上游 Issue #15)
+                        if text:
+                            buffered_thought_sig = None
                 auth_manager.current_prepared = None
             except Exception as exc:
                 last_stream_error = exc
@@ -813,6 +896,16 @@ async def stream_generation(
 
     if not stream_completed and last_stream_error is not None:
         raise last_stream_error
+    # 尾随独立 thoughtSignature:流结束时仍有未被后续内容消费的签名,单独补发,
+    # 避免下一轮对话因缺失签名被上游拒绝(上游 19fe769 / Issue #15)
+    if buffered_thought_sig:
+        yield StreamEvent(
+            kind="thought_signature",
+            payload=buffered_thought_sig,
+            model=normalized.model if normalized else model_path,
+            response_id=latest_response_id,
+        )
+        buffered_thought_sig = None
     target_model = normalized.model if normalized else model_path
     record_rotator_event("success", model=target_model, usage=final_usage)
     if normalized is not None:

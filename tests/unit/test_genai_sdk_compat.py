@@ -14,11 +14,18 @@ from aistudio_api.api.app import app
 from aistudio_api.api.dependencies import get_client
 from aistudio_api.domain.errors import UsageLimitExceeded
 from aistudio_api.domain.models import Candidate, ModelOutput
+from aistudio_api.infrastructure.gateway.client import PreparedRequest
 
 
 @pytest.fixture
 def mock_client() -> MagicMock:
-    return MagicMock()
+    client = MagicMock()
+    client.prepare_request = AsyncMock(
+        return_value=PreparedRequest(
+            url="https://example.test/rpc", headers={}, body="[]"
+        )
+    )
+    return client
 
 
 @pytest.mark.asyncio
@@ -158,10 +165,9 @@ async def test_genai_sdk_function_calling_and_response_flow(
 
     async def fake_generate(
         model: str,
-        contents: list[object],
         **kwargs: object,
     ) -> ModelOutput:
-        captured_requests.append((model, contents))
+        captured_requests.append((model, kwargs.get("contents")))
         if len(captured_requests) == 1:
             return ModelOutput(
                 candidates=[

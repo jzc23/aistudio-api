@@ -18,12 +18,27 @@ from aistudio_api.infrastructure.account.cookie_parser import (
     apply_set_cookies,
     calculate_sapisid_hash,
     filter_minimal_cookies,
+    get_cookie_id_from_meta,
     get_tier_header_value,
     load_cookies_from_auth_file,
+)
+from aistudio_api.infrastructure.gateway.headers import (
+    merge_header_case_insensitive,
 )
 from aistudio_api.infrastructure.utils.logger import get_logger
 
 logger = get_logger("transport")
+
+# 这些头由本层重新计算或由 httpx 自行填充，必须整条剔除后再重建。
+_DROPPED_HEADER_NAMES = frozenset(
+    {
+        "host",
+        "content-length",
+        "authorization",
+        "x-goog-authuser",
+        "x-aistudio-g1-tier",
+    }
+)
 
 
 def _get_auth_cookies(auth_file: str | None = None) -> dict[str, str] | None:
@@ -67,6 +82,7 @@ def _sync_response_cookies(
     resp: httpx.Response,
     auth_file: str | None = None,
     cookies: dict[str, str] | None = None,
+    expected_cookie_id: str | None = None,
 ) -> None:
     """捕获上游响应中的 Set-Cookie 并同步回内存与 AccountStore。"""
     set_cookies = resp.headers.get_list("set-cookie")
@@ -87,6 +103,7 @@ def _sync_response_cookies(
         AccountStore().update_account_cookies(
             auth_file=auth_file,
             new_cookies=target_map,
+            expected_cookie_id=expected_cookie_id,
         )
     except Exception as e:
         logger.debug("持久化 Set-Cookie 失败: %s", e)
@@ -106,37 +123,37 @@ async def _ensure_authorization_header(
             incoming_auth = str(v)
             break
 
-    clean_headers = {
-        k: v
-        for k, v in headers.items()
-        if k.lower()
-        not in (
-            "host",
-            "content-length",
-            "authorization",
-            "x-goog-authuser",
-            "x-aistudio-g1-tier",
-        )
-    }
-    clean_headers["X-Goog-AuthUser"] = str(auth_user or "0")
+    # 大小写不敏感累积：HTTP/2 会把同名头压成同一个名字，若字典里残留仅大小写不同的
+    # 两个键（如 -bin 与 -Bin），httpx 会把两条都发出去并触发上游 403。
+    clean_headers: dict[str, str] = {}
+    for k, v in headers.items():
+        if k.lower() in _DROPPED_HEADER_NAMES:
+            continue
+        merge_header_case_insensitive(clean_headers, str(k), str(v))
+    merge_header_case_insensitive(
+        clean_headers, "X-Goog-AuthUser", str(auth_user or "0")
+    )
     effective_tier = tier if tier is not None else _get_active_account_tier()
     tier_header = get_tier_header_value(effective_tier)
     if tier_header:
-        clean_headers["X-AIStudio-G1-Tier"] = tier_header
+        merge_header_case_insensitive(clean_headers, "X-AIStudio-G1-Tier", tier_header)
 
     raw_cookie_dict = cookies or _get_auth_cookies(auth_file)
     cookie_dict = filter_minimal_cookies(raw_cookie_dict) if raw_cookie_dict else None
 
-    if incoming_auth:
-        clean_headers["Authorization"] = incoming_auth
-    elif cookie_dict:
+    if cookie_dict:
         fresh_auth = calculate_sapisid_hash(cookie_dict)
         if fresh_auth:
-            clean_headers["Authorization"] = fresh_auth
-    if "Cookie" not in clean_headers and cookie_dict:
-        clean_headers["Cookie"] = "; ".join(
-            f"{k}={v}" for k, v in cookie_dict.items() if v
+            merge_header_case_insensitive(clean_headers, "Authorization", fresh_auth)
+        elif incoming_auth:
+            merge_header_case_insensitive(clean_headers, "Authorization", incoming_auth)
+        merge_header_case_insensitive(
+            clean_headers,
+            "Cookie",
+            "; ".join(f"{k}={v}" for k, v in cookie_dict.items() if v),
         )
+    elif incoming_auth:
+        merge_header_case_insensitive(clean_headers, "Authorization", incoming_auth)
 
     return clean_headers
 
@@ -147,14 +164,12 @@ class HTTPStreamTransport:
     def __init__(
         self,
         proxy_url: str | None = None,
-        timeout: float = 120.0,
         read_timeout: float | None = None,
     ) -> None:
         self.proxy_url = proxy_url or settings.proxy_url
-        self.timeout = timeout
         # 上游流式读超时:ATG 合成通道在整篇长文生成期间上游可能长时间不吐
-        # 字节(下游已有 SSE 心跳保活,上游静默是合法状态),默认放宽到 600s,
-        # 可用 AISTUDIO_UPSTREAM_READ_TIMEOUT 环境变量覆盖。
+        # 字节(下游已有 SSE 心跳保活,上游静默是合法状态),默认 600s,
+        # 可用 AISTUDIO_UPSTREAM_READ_TIMEOUT 环境变量覆盖(上游 19fe769 用 900s)。
         if read_timeout is None:
             try:
                 read_timeout = float(os.environ.get("AISTUDIO_UPSTREAM_READ_TIMEOUT", "600"))
@@ -170,9 +185,15 @@ class HTTPStreamTransport:
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
+            # 不设总超时(timeout=None):长流式生成合法地超过任何整段上限;
+            # 读超时独立可调,connect/write/pool 用短值快速暴露网络问题
             self._client = httpx.AsyncClient(
                 timeout=httpx.Timeout(
-                    self.timeout, connect=15.0, read=self.read_timeout
+                    timeout=None,
+                    connect=20.0,
+                    read=self.read_timeout,
+                    write=60.0,
+                    pool=20.0,
                 ),
                 proxy=self.proxy_url,
                 http2=True,
@@ -190,15 +211,25 @@ class HTTPStreamTransport:
         tier: str | None = None,
         auth_file: str | None = None,
         cookies: dict[str, str] | None = None,
+        expected_cookie_id: str | None = None,
     ) -> tuple[int, bytes]:
         """Execute non-streaming HTTP request directly."""
         t0 = time.perf_counter()
+        # 必须在网络等待前捕获 Cookie 与代际，不能用响应到达后的新凭据回填。
+        request_cookies = (
+            cookies if cookies is not None else (_get_auth_cookies(auth_file) or {})
+        )
+        cookie_id = (
+            expected_cookie_id
+            if expected_cookie_id is not None
+            else get_cookie_id_from_meta(auth_file)
+        )
         clean_headers = await _ensure_authorization_header(
             headers,
             auth_user=auth_user,
             tier=tier,
             auth_file=auth_file,
-            cookies=cookies,
+            cookies=request_cookies,
         )
         logger.debug(
             "发送请求: url=%s, body_len=%d, u/%s",
@@ -212,7 +243,12 @@ class HTTPStreamTransport:
             resp = await client.post(
                 url, headers=clean_headers, content=body.encode("utf-8")
             )
-            _sync_response_cookies(resp, auth_file=auth_file, cookies=cookies)
+            _sync_response_cookies(
+                resp,
+                auth_file=auth_file,
+                cookies=request_cookies,
+                expected_cookie_id=cookie_id,
+            )
             elapsed_ms = (time.perf_counter() - t0) * 1000
             logger.debug(
                 "请求完成: status=%d, 耗时=%.1fms, 响应长度=%d",
@@ -238,14 +274,24 @@ class HTTPStreamTransport:
         tier: str | None = None,
         auth_file: str | None = None,
         cookies: dict[str, str] | None = None,
+        expected_cookie_id: str | None = None,
     ) -> AsyncGenerator[tuple[str, object], None]:
         """Stream HTTP response chunks directly."""
+        # 必须在网络等待前捕获 Cookie 与代际，不能用响应到达后的新凭据回填。
+        request_cookies = (
+            cookies if cookies is not None else (_get_auth_cookies(auth_file) or {})
+        )
+        cookie_id = (
+            expected_cookie_id
+            if expected_cookie_id is not None
+            else get_cookie_id_from_meta(auth_file)
+        )
         clean_headers = await _ensure_authorization_header(
             headers,
             auth_user=auth_user,
             tier=tier,
             auth_file=auth_file,
-            cookies=cookies,
+            cookies=request_cookies,
         )
         logger.debug("建立流式请求: url=%s, u/%s", url, auth_user)
 
@@ -257,7 +303,12 @@ class HTTPStreamTransport:
                 "POST", url, headers=clean_headers, content=body.encode("utf-8")
             )
             resp = await client.send(req, stream=True)
-            _sync_response_cookies(resp, auth_file=auth_file, cookies=cookies)
+            _sync_response_cookies(
+                resp,
+                auth_file=auth_file,
+                cookies=request_cookies,
+                expected_cookie_id=cookie_id,
+            )
             yield ("status", resp.status_code)
 
             if resp.status_code != 200:
