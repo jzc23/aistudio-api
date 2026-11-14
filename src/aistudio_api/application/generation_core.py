@@ -12,6 +12,7 @@ import re
 import time
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
+from pathlib import Path
 
 from fastapi import HTTPException
 from fastapi.exceptions import RequestValidationError
@@ -47,6 +48,7 @@ from aistudio_api.infrastructure.gateway.client import (
     AIStudioClient,
     PreparedRequest,
 )
+from aistudio_api.infrastructure.gateway.session import SessionContext
 from aistudio_api.infrastructure.utils.logger import get_logger
 
 logger = get_logger("generation")
@@ -326,15 +328,23 @@ async def handle_attempt_exception(
     model_path: str,
     normalized_model: str | None,
     has_yielded_data: bool = False,
+    request_ctx: SessionContext | None = None,
 ) -> bool:
     """Handle per-attempt error classification and account switching.
 
     Returns True if the operation should be retried, or raises HTTPException / re-raises.
+    ``request_ctx`` pins the failed account to the request's own session context
+    (upstream d4ddd09 semantics) so account switches never mis-target after a
+    previous rotation has already changed the active account.
     """
     target_model = normalized_model or model_path
     account_svc = runtime_state.account_service
-    active_acc = account_svc.get_active_account() if account_svc else None
-    failed_id = active_acc.id if active_acc else None
+    failed_id: str | None = None
+    if request_ctx is not None and request_ctx.auth_file:
+        failed_id = Path(request_ctx.auth_file).parent.name
+    if failed_id is None:
+        active_acc = account_svc.get_active_account() if account_svc else None
+        failed_id = active_acc.id if active_acc else None
 
     # Cookie 代际更新(重新导入/轮转)导致的陈旧签名:未出数据直接重备请求,
     # 已出数据只能中断(上游 62cb23b 语义)
