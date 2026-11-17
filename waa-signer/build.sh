@@ -14,9 +14,11 @@ HOST_OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
 case "$ARCH" in
   x86_64|amd64)
     GO_ARCH="amd64"
+    ZIG_ARCH="x86_64"
     ;;
   aarch64|arm64)
     GO_ARCH="arm64"
+    ZIG_ARCH="aarch64"
     ;;
   *)
     echo "不支持的架构: $ARCH" >&2
@@ -111,28 +113,38 @@ fi
 
 # 检查编译器
 if command -v zig >/dev/null 2>&1; then
-  # zig 用 aarch64/x86_64 命名,Go 用 arm64/amd64 —— 必须转换
-  case "$GO_ARCH" in
-    amd64) ZIG_ARCH="x86_64" ;;
-    arm64) ZIG_ARCH="aarch64" ;;
-    *)     ZIG_ARCH="$GO_ARCH" ;;
-  esac
   case "$TARGET_GOOS" in
-    linux)   ZIG_TARGET="${ZIG_ARCH}-linux-musl" ;;
-    darwin)  ZIG_TARGET="${ZIG_ARCH}-macos-none" ;;
-    windows) ZIG_TARGET="${ZIG_ARCH}-windows-gnu" ;;
+    linux)
+      ZIG_TARGET="${ZIG_ARCH}-linux-musl"
+      EXTLDFLAGS="-static -Wl,--strip-all"
+      ;;
+    darwin)
+      ZIG_TARGET="${ZIG_ARCH}-macos-none"
+      EXTLDFLAGS="-Wl,-S,-x"
+      ;;
+    windows)
+      ZIG_TARGET="${ZIG_ARCH}-windows-gnu"
+      EXTLDFLAGS="-static -Wl,--strip-all"
+      ;;
   esac
   CC_CMD="zig cc -target ${ZIG_TARGET}"
   CXX_CMD="zig c++ -target ${ZIG_TARGET}"
-  EXTLDFLAGS="-static -Wl,--strip-all"
 elif command -v clang >/dev/null 2>&1; then
   CC_CMD="clang"
   CXX_CMD="clang++"
-  EXTLDFLAGS="-Wl,--strip-all"
+  if [ "$TARGET_GOOS" = "darwin" ]; then
+    EXTLDFLAGS="-Wl,-S,-x"
+  else
+    EXTLDFLAGS="-Wl,--strip-all"
+  fi
 elif command -v gcc >/dev/null 2>&1; then
   CC_CMD="gcc"
   CXX_CMD="g++"
-  EXTLDFLAGS="-Wl,--strip-all"
+  if [ "$TARGET_GOOS" = "darwin" ]; then
+    EXTLDFLAGS="-Wl,-S,-x"
+  else
+    EXTLDFLAGS="-Wl,--strip-all"
+  fi
 else
   echo "错误: 未找到 zig, clang 或 gcc 编译器。请先安装 (例如: pkg install zig 或 apt install clang)" >&2
   exit 1
@@ -152,7 +164,7 @@ CGO_ENABLED=1 GOOS="${TARGET_GOOS}" GOARCH="${GO_ARCH}" \
   CGO_LDFLAGS="-L${DEPS_DIR}/lib" \
   go build -trimpath -tags netgo,osusergo \
   -ldflags="-s -w -linkmode external -extldflags '${EXTLDFLAGS}'" \
-  -o "bin/${BIN_NAME}" ./cmd/waa-signer
-
+  -o "bin/${BIN_NAME}.tmp" ./cmd/waa-signer
+mv -f "bin/${BIN_NAME}.tmp" "bin/${BIN_NAME}"
 echo ">>> 编译成功: ${SCRIPT_DIR}/bin/${BIN_NAME}"
 ls -lh "bin/${BIN_NAME}"
