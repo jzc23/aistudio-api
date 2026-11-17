@@ -43,6 +43,9 @@ from aistudio_api.application.generation_core import (
     SHORT_RATE_LIMIT_COOLDOWN_SECONDS,
     WIRE_TO_GEMINI_FINISH_REASON,
     Auth403RetryManager,
+    _is_prepared_binding_current,
+    _record_request_rotator_event,
+    _request_context_snapshot,
     active_account_cooldown_remaining,
     classify_gemini_error_payload,
     clean_upstream_error_message,
@@ -52,7 +55,13 @@ from aistudio_api.application.generation_core import (
     stream_generation,
     to_gemini_finish_reason,
 )
-from aistudio_api.domain.errors import AuthError, SessionExpiredError
+from aistudio_api.domain.errors import (
+    AccountRestrictedError,
+    AccountVerificationRequiredError,
+    AuthError,
+    SessionExpiredError,
+    TransportError,
+)
 from aistudio_api.infrastructure.gateway.client import AIStudioClient
 from aistudio_api.infrastructure.gateway.session import SessionContext
 from aistudio_api.infrastructure.utils.logger import get_logger
@@ -139,20 +148,29 @@ async def handle_gemini_generate_content(
         )
 
     # 启动非流式生成任务并提供防 524 代理超时的保活机制 (NONSTREAM_KEEPALIVE)
+    from aistudio_api.api.streaming_response import (
+        RequestStreamingResponse,
+        close_generation_task,
+    )
+
     gen_task = asyncio.create_task(
         _do_generate_content(model_path, req, client, stream=False)
     )
     try:
         # 前 10 秒直接等待结果；绝大多数请求在此期间返回标准对象
         return await asyncio.wait_for(asyncio.shield(gen_task), timeout=10.0)
+    except asyncio.CancelledError:
+        # shield 不能让已断开的客户端留下后台生成任务
+        await close_generation_task(gen_task)
+        raise
     except TimeoutError:
         logger.info(
             "非流式请求耗时超过 10s，激活 HTTP 换行保活流: model=%s", model_path
         )
 
         async def keepalive_stream():
-            yield b"\n"
             try:
+                yield b"\n"
                 while not gen_task.done():
                     try:
                         await asyncio.wait_for(asyncio.shield(gen_task), timeout=10.0)
@@ -174,15 +192,12 @@ async def handle_gemini_generate_content(
                 }
                 yield json.dumps(err_payload, ensure_ascii=False).encode("utf-8")
             finally:
-                if not gen_task.done():
-                    gen_task.cancel()
-                elif not gen_task.cancelled():
-                    _ = gen_task.exception()
+                await close_generation_task(gen_task)
 
-        return StreamingResponse(
+        return RequestStreamingResponse(
             keepalive_stream(),
             media_type="application/json",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            generation_task=gen_task,
         )
 
 
@@ -215,28 +230,35 @@ def format_sse_event(
             part.model_dump(mode="json", exclude_none=True)
             for part in to_gemini_parts("", function_calls=fc_list)
         ]
-        if thought_signature and parts and not parts[0].get("thoughtSignature"):
-            parts[0]["thoughtSignature"] = thought_signature
     elif event_type == "images":
         img_list = text if isinstance(text, list) else []
         parts = [
             part.model_dump(mode="json", exclude_none=True)
             for part in to_gemini_parts("", images=img_list)
         ]
-        if thought_signature and parts and not parts[0].get("thoughtSignature"):
-            parts[0]["thoughtSignature"] = thought_signature
     elif event_type == "reasoning_images":
         r_img_list = text if isinstance(text, list) else []
         parts = [
             part.model_dump(mode="json", exclude_none=True)
             for part in to_gemini_parts("", reasoning_images=r_img_list)
         ]
-        if thought_signature and parts and not parts[0].get("thoughtSignature"):
-            parts[0]["thoughtSignature"] = thought_signature
     elif event_type == "thought_signature":
         parts = [{"thoughtSignature": str(text)}]
     else:
         return None
+
+    if (
+        thought_signature
+        and parts
+        and event_type in ("tool_calls", "images", "reasoning_images")
+    ):
+        existing_signature = parts[0].get("thoughtSignature")
+        if not existing_signature:
+            parts[0]["thoughtSignature"] = thought_signature
+        elif existing_signature != thought_signature:
+            # 独立签名不能覆盖工具或图片自己的签名,按原顺序保留独立 Part
+            # (上游 fcdc53e / tool roundtrip thoughtSignatures 语义)
+            parts.insert(0, {"thoughtSignature": thought_signature})
 
     payload: dict[str, object] = {
         "candidates": [{"content": {"role": "model", "parts": parts}, "index": 0}]
@@ -307,46 +329,58 @@ def _build_gemini_streaming_response(
     model_path: str,
 ) -> StreamingResponse:
     async def sse_chunks():
+        # aclosing:外层(SSE 响应/心跳包装)关闭时确定性关闭 stream_generation,
+        # 让 aclosing 清理链直达传输层(上游 fcdc53e 流资源生命周期语义)
+        from contextlib import aclosing
+
         try:
-            async for event in stream_generation(
-                model_path=model_path,
-                req=req,
-                client=client,
-                api_format="gemini",
-            ):
-                if event.kind == "usage":
-                    yield format_sse_usage(
-                        event.payload if isinstance(event.payload, dict) else None,
-                        finish_reason=event.finish_reason or "STOP",
+            async with aclosing(
+                stream_generation(
+                    model_path=model_path,
+                    req=req,
+                    client=client,
+                    api_format="gemini",
+                )
+            ) as stream:
+                async for event in stream:
+                    if event.kind == "usage":
+                        yield format_sse_usage(
+                            event.payload if isinstance(event.payload, dict) else None,
+                            finish_reason=event.finish_reason or "STOP",
+                            model_version=event.model,
+                            response_id=event.response_id,
+                        )
+                        continue
+                    chunk = format_sse_event(
+                        event.kind,
+                        event.payload,
                         model_version=event.model,
                         response_id=event.response_id,
+                        thought_signature=event.thought_signature,
                     )
-                    continue
-                chunk = format_sse_event(
-                    event.kind,
-                    event.payload,
-                    model_version=event.model,
-                    response_id=event.response_id,
-                    thought_signature=event.thought_signature,
-                )
-                if chunk:
-                    yield chunk
+                    if chunk:
+                        yield chunk
         except Exception as exc:
             logger.warning("流式生成异常: model=%s, error=%s", model_path, exc)
             yield format_sse_error(exc)
 
     # 心跳保活:静默超过 15s 输出 SSE 注释行,防止网关空闲超时 504
-    # (ATG 合成通道首段内容出现前常有长静默)
+    # (ATG 合成通道首段内容出现前常有长静默);aclosing 保证关闭链确定性传播
     async def stream_response():
+        from contextlib import aclosing
+
         from aistudio_api.api.sse_heartbeat import heartbeat_sse
 
-        async for chunk in heartbeat_sse(sse_chunks()):
-            yield chunk
+        async with aclosing(heartbeat_sse(sse_chunks())) as wrapped:
+            async for chunk in wrapped:
+                yield chunk
 
-    return StreamingResponse(
+    # ASGI 生命周期绑定:客户端断开时同步关闭迭代器(aclosing 链直达传输层)
+    from aistudio_api.api.streaming_response import RequestStreamingResponse
+
+    return RequestStreamingResponse(
         stream_response(),
         media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 
@@ -357,6 +391,7 @@ async def handle_gemini_decisions(
     last_error: Exception | None = None
     auth_manager = Auth403RetryManager()
     total_attempts = MAX_RETRIES + AUTH_403_MAX_RETRIES
+    ordinary_attempt = 0
     raw_model = req.model or "gemini-decision-1"
     norm_model = raw_model if raw_model.startswith("models/") else f"models/{raw_model}"
     questions_dict: dict[str, dict[str, object]] = {
@@ -365,8 +400,16 @@ async def handle_gemini_decisions(
     }
 
     for attempt in range(total_attempts):
-        await ensure_active_account(attempt, model=norm_model)
-        request_ctx: SessionContext | None = None
+        # 403 重试单独计数,普通失败共用 MAX_RETRIES 预算(上游 fcdc53e/PR #21)
+        if ordinary_attempt >= MAX_RETRIES:
+            break
+        ensured_ctx = await ensure_active_account(attempt, model=norm_model)
+        effective_ctx = auth_manager.pinned_ctx or (
+            ensured_ctx
+            if isinstance(ensured_ctx, SessionContext)
+            else _request_context_snapshot(client)
+        )
+        request_ctx: SessionContext | None = effective_ctx
         try:
             logger.info(
                 "Decisions 请求: model=%s, questions=%d, 尝试=%d/%d",
@@ -378,15 +421,23 @@ async def handle_gemini_decisions(
             force_recreate = auth_manager.force_recreate_signer
             auth_manager.force_recreate_signer = False
             prepared = auth_manager.current_prepared
-            if prepared is None:
+            if (
+                prepared is not None
+                and not force_recreate
+                and not _is_prepared_binding_current(prepared)
+            ):
+                # 与生成接口一致,切号、禁用或凭据更新后不能重放缓存签名
+                prepared = None
+            if prepared is None or force_recreate:
                 prepared = await client.prepare_decision_request(
                     model=norm_model,
                     raw_input=req.input,
                     questions=questions_dict,
                     temperature=req.temperature,
                     force_recreate_signer=force_recreate,
+                    ctx=effective_ctx,
                 )
-            request_ctx = prepared.ctx
+            request_ctx = prepared.ctx or effective_ctx
             auth_manager.current_prepared = prepared
             result = await client.create_decision(
                 model=norm_model,
@@ -403,7 +454,10 @@ async def handle_gemini_decisions(
                 "completion_tokens": 0,
                 "total_tokens": total_tokens,
             }
-            record_rotator_event("success", model=norm_model, usage=rotator_usage)
+            _record_request_rotator_event(
+                "success", model=norm_model, request_ctx=request_ctx,
+                usage=rotator_usage,
+            )
             runtime_state.record(
                 norm_model,
                 "success",
@@ -432,28 +486,36 @@ async def handle_gemini_decisions(
             )
         except Exception as exc:
             last_error = exc
-            if isinstance(exc, AuthError) and not isinstance(exc, SessionExpiredError):
-                if await auth_manager.handle_403(exc, model=norm_model, client=client):
+            if isinstance(exc, AuthError) and not isinstance(
+                exc,
+                (
+                    SessionExpiredError,
+                    AccountVerificationRequiredError,
+                    AccountRestrictedError,
+                ),
+            ):
+                if await auth_manager.handle_403(
+                    exc, model=norm_model, client=client, request_ctx=request_ctx
+                ):
                     continue
                 raise
             if await handle_attempt_exception(
                 exc,
-                attempt=attempt,
+                attempt=ordinary_attempt,
                 model_path=norm_model,
                 normalized_model=norm_model,
                 request_ctx=request_ctx,
             ):
+                ordinary_attempt += 1
                 auth_manager.current_prepared = None
+                auth_manager.pinned_ctx = None
                 continue
             raise
 
-    raise HTTPException(
-        429,
-        detail={
-            "message": f"All accounts reached daily quota for model '{norm_model}'. Quota resets at 00:00 PST.",
-            "type": "rate_limit_exceeded",
-        },
-    ) from last_error
+    # 普通预算耗尽后保留实际故障,不能将会话失效或传输失败改报日配额
+    error = last_error or TransportError("Request retry budget exhausted.")
+    status_code, message, _ = classify_gemini_error_payload(error)
+    raise HTTPException(status_code, detail={"message": message}) from error
 
 
 async def handle_gemini_count_tokens(
@@ -478,15 +540,44 @@ async def handle_gemini_count_tokens(
             },
         )
 
+    if (
+        effective_req.systemInstruction is not None
+        and effective_req.systemInstruction.parts
+    ) or effective_req.tools:
+        # 当前计数 RPC 只承载 contents,拒绝静默丢弃会影响计数的字段
+        raise HTTPException(
+            400,
+            detail={
+                "message": (
+                    "countTokens currently supports contents only; "
+                    "systemInstruction and tools are not supported."
+                ),
+                "type": "bad_request",
+            },
+        )
+
     normalized = normalize_gemini_request(effective_req, model_path)
     last_error: Exception | None = None
     for attempt in range(MAX_RETRIES):
-        await ensure_active_account(attempt, model=normalized.model)
+        ensured_ctx = await ensure_active_account(attempt, model=normalized.model)
+        # 在请求进入客户端前绑定实际账号,失败时不读取已切换的全局会话
+        request_ctx = (
+            ensured_ctx
+            if isinstance(ensured_ctx, SessionContext)
+            else _request_context_snapshot(client)
+        )
         try:
-            res = await client.count_tokens(
-                model=normalized.model,
-                contents=normalized.contents,
-            )
+            if isinstance(ensured_ctx, SessionContext):
+                res = await client.count_tokens(
+                    model=normalized.model,
+                    contents=normalized.contents,
+                    ctx=ensured_ctx,
+                )
+            else:
+                res = await client.count_tokens(
+                    model=normalized.model,
+                    contents=normalized.contents,
+                )
             raw_cached = res.get("cachedContentTokenCount")
             cached_count = (
                 int(str(raw_cached))
@@ -506,9 +597,6 @@ async def handle_gemini_count_tokens(
             )
         except Exception as exc:
             last_error = exc
-            request_ctx = getattr(
-                getattr(client, "session", None), "active_context", None
-            )
             if await handle_attempt_exception(
                 exc,
                 attempt=attempt,
@@ -519,10 +607,6 @@ async def handle_gemini_count_tokens(
                 continue
             raise
 
-    raise HTTPException(
-        429,
-        detail={
-            "message": f"All accounts reached daily quota for model '{normalized.model}'.",
-            "type": "rate_limit_exceeded",
-        },
-    ) from last_error
+    error = last_error or TransportError("Request retry budget exhausted.")
+    status_code, message, _ = classify_gemini_error_payload(error)
+    raise HTTPException(status_code, detail={"message": message}) from error

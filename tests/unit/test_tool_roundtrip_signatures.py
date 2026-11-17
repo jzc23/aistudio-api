@@ -202,6 +202,8 @@ async def test_streaming_tool_and_tail_signature_survive_full_history(
     client.stream_generate_content = stream_generate_content
     # 账号门禁与协议验收分开；报文解析、SSE 和回传线编码均使用真实实现。
     monkeypatch.setattr(gemini_service, "ensure_active_account", AsyncMock())
+    from aistudio_api.application import generation_core as _gcore
+    monkeypatch.setattr(_gcore, "ensure_active_account", AsyncMock())
     monkeypatch.setitem(app.dependency_overrides, get_client, lambda: client)
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://testserver"

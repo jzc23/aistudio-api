@@ -11,8 +11,10 @@ from __future__ import annotations
 import re
 import time
 from collections.abc import AsyncIterator, Callable
+from contextlib import aclosing
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 from fastapi import HTTPException
 from fastapi.exceptions import RequestValidationError
@@ -32,6 +34,8 @@ from aistudio_api.application.chat_service import (
     normalize_gemini_request,
 )
 from aistudio_api.domain.errors import (
+    AccountRestrictedError,
+    AccountVerificationRequiredError,
     AistudioError,
     AuthError,
     RequestError,
@@ -44,6 +48,7 @@ from aistudio_api.domain.errors import (
     parse_upstream_grpc_error,
 )
 from aistudio_api.domain.models import ModelOutput
+from aistudio_api.infrastructure.account.account_store import AccountMeta
 from aistudio_api.infrastructure.gateway.client import (
     AIStudioClient,
     PreparedRequest,
@@ -56,6 +61,13 @@ logger = get_logger("generation")
 # ATG event types forwarded through the streaming unwrapper. usage /
 # finish_reason / response_id / thought_signature keep their dedicated branches.
 _ATG_STREAM_EVENT_TYPES = frozenset(
+    {"body", "thinking", "tool_calls", "images", "reasoning_images"}
+)
+
+# Renderer-consumable event kinds: only these may consume the buffered
+# standalone thoughtSignature (unknown kinds render to nothing and must not
+# swallow a pending signature -- upstream fcdc53e tool roundtrip semantics).
+_RENDERABLE_STREAM_EVENT_TYPES = frozenset(
     {"body", "thinking", "tool_calls", "images", "reasoning_images"}
 )
 
@@ -122,19 +134,142 @@ def active_account_cooldown_remaining(account_id: str | None, model: str) -> flo
         return 0.0
 
 
+def _request_context_snapshot(client: AIStudioClient) -> SessionContext:
+    """在签名前绑定本次账号,未知来源用空上下文阻止回退到新活跃账号。"""
+    session = getattr(client, "session", None)
+    context = getattr(session, "active_context", None) if session is not None else None
+    return context if isinstance(context, SessionContext) else SessionContext()
+
+
+def _request_account(
+    request_ctx: SessionContext | None,
+) -> tuple[AccountMeta | None, str | None]:
+    """按本次请求凭据定位账号,显式未知来源不能落到新的全局账号。"""
+    account_svc = runtime_state.account_service
+    if account_svc is None:
+        return None, None
+    if request_ctx is not None:
+        if not request_ctx.auth_file:
+            return None, None
+        account_id = Path(request_ctx.auth_file).parent.name
+        return account_svc.get_account(account_id), account_id
+    account = account_svc.get_active_account()
+    return account, account.id if account else None
+
+
+def _is_request_generation_current(request_ctx: SessionContext | None) -> bool:
+    """认证结果只能影响生成该请求时使用的 Cookie 代际。"""
+    account_svc = runtime_state.account_service
+    if request_ctx is None or not request_ctx.auth_file or account_svc is None:
+        return True
+    return bool(
+        account_svc.is_cookie_generation_current(
+            Path(request_ctx.auth_file).parent.name, request_ctx.cookie_id
+        )
+    )
+
+
+def _record_request_rotator_event(
+    event: Literal["auth_error", "rate_limited", "error", "success"],
+    *,
+    model: str,
+    request_ctx: SessionContext | None,
+    usage: dict[str, object] | None = None,
+) -> None:
+    """只记录本次请求的当前代际账号,未知或已删除来源不影响新活跃账号。"""
+    if request_ctx is None:
+        record_rotator_event(event, model=model, usage=usage)
+        return
+    if not request_ctx.auth_file:
+        return
+    account, account_id = _request_account(request_ctx)
+    rotator = runtime_state.rotator
+    if (
+        account is None
+        or account_id is None
+        or rotator is None
+        or not _is_request_generation_current(request_ctx)
+    ):
+        return
+    record_rotator_event(event, model=model, usage=usage, account_id=account_id)
+
+
+def _is_prepared_binding_current(prepared: PreparedRequest) -> bool:
+    """重放缓存签名时核对账户启用状态、代际、登录索引与订阅权益。"""
+    account_svc = runtime_state.account_service
+    if account_svc is None:
+        return True
+    ctx = prepared.ctx
+    account = account_svc.get_active_account()
+    if (
+        ctx is None
+        or not ctx.auth_file
+        or account is None
+        or not account.enabled
+        or Path(ctx.auth_file).parent.name != account.id
+        or not _is_request_generation_current(ctx)
+        or ctx.auth_user != account.auth_user
+    ):
+        return False
+    from aistudio_api.infrastructure.account.cookie_parser import normalize_benefit_tier
+
+    return normalize_benefit_tier(ctx.tier) == normalize_benefit_tier(account.tier)
+
+
 class Auth403RetryManager:
     """403 阶梯重试管理器：前 2 次重放，后 2 次重新签名，最后 1 次切号。
 
     force_recreate_signer 用于通知本地/远程签名服务销毁僵死热 Worker 冷重建
     (上游 19fe769 语义):第 3 次(重签)与第 5 次(切号)置位,由调用方在
     下一次请求中消费后立即归零,避免重复触发昂贵的冷启动。
+    pinned_ctx (上游 85e22c3/fcdc53e 语义):重签期间把请求钉在原账号会话上,
+    不随并发切号漂移;切号成功后清空。
     """
 
     def __init__(self, max_retries: int = AUTH_403_MAX_RETRIES) -> None:
         self.count: int = 0
         self.max_retries: int = max_retries
         self.current_prepared: PreparedRequest | None = None
+        self.pinned_ctx: SessionContext | None = None
         self.force_recreate_signer: bool = False
+
+    @staticmethod
+    def _diagnostic_context(
+        client: AIStudioClient,
+        prepared: PreparedRequest | None,
+        request_ctx: SessionContext | None,
+    ) -> str:
+        """403 诊断上下文:账号/签名服务/worker 池/UA,定位 403 根因。"""
+        signer_id = "unknown"
+        outer_ua = ""
+        pool_state = ""
+        try:
+            from aistudio_api.infrastructure.gateway.model_defaults import (
+                get_active_waa_server,
+            )
+
+            waa_cfg = get_active_waa_server()
+            signer_id = str(waa_cfg.get("id") or "unknown")
+            outer_ua = str(waa_cfg.get("user_agent") or "")
+        except Exception:
+            pass
+        if prepared is not None and isinstance(prepared.headers, dict):
+            outer_ua = str(prepared.headers.get("User-Agent") or outer_ua)
+        session = getattr(client, "session", None)
+        signer = getattr(session, "_signer", None) if session is not None else None
+        if signer is not None:
+            pool_state = str(getattr(signer, "last_pool_state", "") or "")
+        acc, acc_id = _request_account(request_ctx)
+        auth_user = (
+            acc.auth_user
+            if acc is not None
+            else (request_ctx.auth_user if request_ctx is not None else "0")
+        )
+        return (
+            f"account={acc_id or 'unknown'}(u/{auth_user}), "
+            f"signer={signer_id}, pool={pool_state or 'unknown'}, "
+            f"ua={outer_ua[:48] or 'default'}"
+        )
 
     async def handle_403(
         self,
@@ -142,35 +277,50 @@ class Auth403RetryManager:
         *,
         model: str,
         client: AIStudioClient,
+        request_ctx: SessionContext | None = None,
         has_yielded_data: bool = False,
     ) -> bool:
+        if request_ctx is None and self.current_prepared is not None:
+            request_ctx = self.current_prepared.ctx
+        if not _is_request_generation_current(request_ctx):
+            self.current_prepared = None
+            self.pinned_ctx = None
+            if not has_yielded_data:
+                return True
+            raise HTTPException(
+                503, detail="Request credentials were replaced."
+            ) from exc
         if has_yielded_data:
             raise HTTPException(
                 403, detail={"message": str(exc), "type": "auth_error"}
             ) from exc
 
+        diag = self._diagnostic_context(client, self.current_prepared, request_ctx)
         self.count += 1
-        record_rotator_event("auth_error", model=model)
+        _record_request_rotator_event(
+            "auth_error", model=model, request_ctx=request_ctx
+        )
 
-        # 1. 前 2 次 403: 重放原有已签名报文 (Replay 1/2, 2/2)
+        # 1. 前 2 次 403: 重放已签名报文 (Replay 1/2, 2/2)
+        #    本次快照由请求处理器绑定,不读取客户端共享的最近请求(并发隔离)。
         if self.count <= 2:
-            self.current_prepared = client.last_prepared_request
             self.force_recreate_signer = False
             logger.warning(
-                "遭遇 403 权限异常，执行第 %d/2 次请求重放 (Replay): model=%s",
+                "遭遇 403 权限异常，执行第 %d/2 次请求重放 (Replay): model=%s, %s",
                 self.count,
                 model,
+                diag,
             )
             return True
 
         # 2. 后 2 次 403: 重新向签名服务生成新快照 (Re-sign 1/2, 2/2)
         if self.count <= 4:
             self.current_prepared = None
-            self.force_recreate_signer = self.count == 3
+            self.pinned_ctx = request_ctx
             # 第 3 次 403: 先尝试轮换当前账号 Cookie 再重签(上游 722b84c 语义)
             if self.count == 3:
                 account_svc = runtime_state.account_service
-                active_acc = account_svc.get_active_account() if account_svc else None
+                active_acc, _ = _request_account(request_ctx)
                 if (
                     account_svc is not None
                     and active_acc is not None
@@ -178,32 +328,50 @@ class Auth403RetryManager:
                 ):
                     try:
                         session = getattr(client, "session", None)
-                        await account_svc.rotate_account_cookies(
+                        result = await account_svc.rotate_account_cookies(
                             active_acc.id, session
                         )
+                        if result.get("stale") is True or not (
+                            _is_request_generation_current(request_ctx)
+                        ):
+                            self.pinned_ctx = None
+                            return True
                     except Exception:
                         pass
+            self.force_recreate_signer = self.count == 3
             logger.warning(
-                "遭遇 403 权限异常，重放未恢复，执行第 %d/2 次重新签名 (Re-sign): model=%s",
+                "遭遇 403 权限异常，执行第 %d/2 次重新签名 (Re-sign): model=%s, "
+                "force_recreate=%s, %s",
                 self.count - 2,
                 model,
+                self.force_recreate_signer,
+                diag,
             )
             return True
 
         # 3. 最后 1 次 403: 切号故障转移 (Failover switch account)
         if self.count == 5:
             self.current_prepared = None
+            self.pinned_ctx = None
             self.force_recreate_signer = True
-            account_svc = runtime_state.account_service
-            active_acc = account_svc.get_active_account() if account_svc else None
-            failed_id = active_acc.id if active_acc else None
-            if await try_switch_account(model=model, failed_account_id=failed_id):
+            _, failed_id = _request_account(request_ctx)
+            if await try_switch_account(
+                model=model,
+                failed_account_id=failed_id,
+                expected_cookie_id=request_ctx.cookie_id if request_ctx else None,
+            ):
                 logger.warning(
-                    "遭遇 403 权限异常，重放与重签均未恢复，已切换至备用账号: model=%s",
+                    "遭遇 403 权限异常，重放与重签均未恢复，已切换至备用账号: "
+                    "model=%s, %s",
                     model,
+                    diag,
                 )
                 return True
-            logger.error("遭遇 403 权限异常且无可用备用账号，终止重试")
+            logger.error(
+                "遭遇 403 权限异常且无可用备用账号，终止重试: model=%s, %s",
+                model,
+                diag,
+            )
             raise HTTPException(
                 403, detail={"message": str(exc), "type": "auth_error"}
             ) from exc
@@ -290,6 +458,7 @@ def classify_gemini_error_payload(exc: Exception) -> tuple[int, str, str]:
             500: "INTERNAL",
             502: "UNAVAILABLE",
             503: "UNAVAILABLE",
+            504: "DEADLINE_EXCEEDED",
         }
         return (
             status,
@@ -308,6 +477,7 @@ def classify_gemini_error_payload(exc: Exception) -> tuple[int, str, str]:
             500: "INTERNAL",
             502: "UNAVAILABLE",
             503: "UNAVAILABLE",
+            504: "DEADLINE_EXCEEDED",
         }
         return (
             status,
@@ -339,12 +509,7 @@ async def handle_attempt_exception(
     """
     target_model = normalized_model or model_path
     account_svc = runtime_state.account_service
-    failed_id: str | None = None
-    if request_ctx is not None and request_ctx.auth_file:
-        failed_id = Path(request_ctx.auth_file).parent.name
-    if failed_id is None:
-        active_acc = account_svc.get_active_account() if account_svc else None
-        failed_id = active_acc.id if active_acc else None
+    active_acc, failed_id = _request_account(request_ctx)
 
     # Cookie 代际更新(重新导入/轮转)导致的陈旧签名:未出数据直接重备请求,
     # 已出数据只能中断(上游 62cb23b 语义)
@@ -361,12 +526,68 @@ async def handle_attempt_exception(
             400, detail={"message": str(exc), "type": "bad_request"}
         ) from exc
 
+    # 认证类错误先核对代际:旧代际的结果不得处罚/切走当前新账号
+    # (上游 fcdc53e 语义)
+    if isinstance(exc, AuthError) and not _is_request_generation_current(request_ctx):
+        if not has_yielded_data:
+            logger.info("忽略旧 Cookie 代际的认证结果: account=%s", failed_id)
+            return True
+        raise HTTPException(
+            503, detail="Request credentials were replaced."
+        ) from exc
+
     if isinstance(exc, SessionExpiredError):
-        logger.warning("账号登录已失效，被重定向到登录页: %s", exc)
+        if not has_yielded_data and account_svc is not None and active_acc is not None:
+            # 遇到 401 时先探活会话并尝试轮换滚动 Cookie,若拿到新 PSIDTS 则原地重试
+            try:
+                from aistudio_api.infrastructure.account.cookie_parser import (
+                    load_cookies_from_auth_file,
+                    probe_aistudio_session,
+                )
+
+                auth_path = account_svc.get_account_auth_path(active_acc.id)
+                cdict = load_cookies_from_auth_file(auth_path) if auth_path else {}
+                before_ts = cdict.get("__Secure-1PSIDTS", "")
+                if cdict:
+                    alive, _ = await probe_aistudio_session(cdict)
+                    if not _is_request_generation_current(request_ctx):
+                        return True
+                    if alive and hasattr(account_svc, "rotate_account_cookies"):
+                        session = (
+                            runtime_state.client.session
+                            if runtime_state.client
+                            else None
+                        )
+                        rot_res = await account_svc.rotate_account_cookies(
+                            active_acc.id, session
+                        )
+                        if rot_res.get("stale") is True or not (
+                            _is_request_generation_current(request_ctx)
+                        ):
+                            return True
+                        new_cookies = rot_res.get("cookies")
+                        after_ts = (
+                            new_cookies.get("__Secure-1PSIDTS", "")
+                            if isinstance(new_cookies, dict)
+                            else ""
+                        )
+                        if rot_res.get("ok") and after_ts and after_ts != before_ts:
+                            logger.info(
+                                "账号 %s 触发 401 后完成 Cookie 轮换，原地重试",
+                                active_acc.id,
+                            )
+                            return True
+            except Exception as rot_err:
+                logger.debug("401 Cookie 轮换探测异常: %s", rot_err)
+
+        if not _is_request_generation_current(request_ctx):
+            return True
+        logger.warning("账号登录已失效: account=%s, %s", failed_id, exc)
         if not has_yielded_data and await try_switch_account(
             model=target_model,
             failed_account_id=failed_id,
             is_session_expired=True,
+            expected_cookie_id=request_ctx.cookie_id if request_ctx else None,
         ):
             logger.info("已切换账号重试: 尝试=%d/%d", attempt + 1, MAX_RETRIES)
             return True
@@ -378,9 +599,57 @@ async def handle_attempt_exception(
             },
         ) from exc
 
+    if isinstance(exc, (AccountVerificationRequiredError, AccountRestrictedError)):
+        # 账号需要身份验证或被服务级限制:立即自动禁用并切号,
+        # 不再浪费 403 重放/重签预算(上游 fcdc53e 语义)
+        if not _is_request_generation_current(request_ctx):
+            if not has_yielded_data:
+                logger.info(
+                    "忽略旧 Cookie 代际的验证/受限结果: account=%s", failed_id
+                )
+                return True
+            raise HTTPException(
+                503, detail="Request credentials were replaced."
+            ) from exc
+        _record_request_rotator_event(
+            "auth_error", model=target_model, request_ctx=request_ctx
+        )
+        if account_svc is not None and failed_id:
+            disabled = account_svc.toggle_account_enabled(failed_id, False)
+            auth_u = (
+                active_acc.auth_user
+                if active_acc is not None
+                else (request_ctx.auth_user if request_ctx is not None else "0")
+            )
+            reason = (
+                "需要身份验证"
+                if isinstance(exc, AccountVerificationRequiredError)
+                else "服务受限"
+            )
+            logger.error(
+                "账号 %s (u/%s) %s，已自动禁用 (disabled=%s): %s",
+                failed_id,
+                auth_u,
+                reason,
+                disabled is not None and not disabled.enabled,
+                exc,
+            )
+        if not has_yielded_data and await try_switch_account(
+            model=target_model,
+            failed_account_id=failed_id,
+            expected_cookie_id=request_ctx.cookie_id if request_ctx else None,
+        ):
+            logger.info("已切换账号重试 (%d/%d)", attempt + 1, MAX_RETRIES)
+            return True
+        raise HTTPException(
+            403, detail={"message": str(exc), "type": "auth_error"}
+        ) from exc
+
     if isinstance(exc, AuthError):
         logger.warning("账号权限被拒绝 (HTTP 403): %s", exc)
-        record_rotator_event("auth_error", model=target_model)
+        _record_request_rotator_event(
+            "auth_error", model=target_model, request_ctx=request_ctx
+        )
 
         raise HTTPException(
             403, detail={"message": str(exc), "type": "auth_error"}
@@ -388,7 +657,9 @@ async def handle_attempt_exception(
 
     if isinstance(exc, UsageLimitExceeded):
         runtime_state.record(target_model, "rate_limited")
-        record_rotator_event("rate_limited", model=target_model)
+        _record_request_rotator_event(
+            "rate_limited", model=target_model, request_ctx=request_ctx
+        )
         if not has_yielded_data and await try_switch_account(
             model=target_model, failed_account_id=failed_id
         ):
@@ -459,24 +730,28 @@ async def handle_attempt_exception(
         )
         return True
     if is_transport_error(exc):
-        logger.warning(
-            "网关传输或签名异常，切换账号重试: 尝试=%d/%d, 错误=%s",
-            attempt + 1,
-            MAX_RETRIES,
-            exc,
+        # 传输失败只能使用普通预算,最后一次失败或已发出内容时不再切号
+        # (上游 fcdc53e/PR #21 语义:attempt 为普通预算计数,不含 403 重试)
+        if not has_yielded_data and attempt < MAX_RETRIES - 1:
+            logger.warning(
+                "网关传输或签名异常，切换账号重试: 尝试=%d/%d, 错误=%s",
+                attempt + 1,
+                MAX_RETRIES,
+                exc,
+            )
+            if await try_switch_account(
+                model=target_model, failed_account_id=failed_id
+            ):
+                logger.info("已切换账号重试: 尝试=%d/%d", attempt + 1, MAX_RETRIES)
+                return True
+        runtime_state.record(target_model, "errors")
+        _record_request_rotator_event(
+            "error", model=target_model, request_ctx=request_ctx
         )
-        if not has_yielded_data and await try_switch_account(
-            model=target_model, failed_account_id=failed_id
-        ):
-            logger.info("已切换账号重试: 尝试=%d/%d", attempt + 1, MAX_RETRIES)
-            return True
-        if isinstance(exc, TransportError):
-            runtime_state.record(target_model, "errors")
-            record_rotator_event("error", model=target_model)
-            logger.warning("上游服务传输中断 (502): %s", exc)
-            raise HTTPException(
-                502, detail={"message": str(exc), "type": "upstream_error"}
-            ) from exc
+        logger.warning("上游服务传输中断 (502): %s", exc)
+        raise HTTPException(
+            502, detail={"message": str(exc), "type": "upstream_error"}
+        ) from exc
     if isinstance(exc, RequestError):
         clean_msg = clean_upstream_error_message(str(exc))
         status_code = exc.status if exc.status > 0 else 500
@@ -496,14 +771,18 @@ async def handle_attempt_exception(
 
     if isinstance(exc, AistudioError):
         runtime_state.record(target_model, "errors")
-        record_rotator_event("error", model=target_model)
+        _record_request_rotator_event(
+            "error", model=target_model, request_ctx=request_ctx
+        )
         logger.warning("服务端处理异常: %s", exc)
         raise HTTPException(
             500, detail={"message": str(exc), "type": "server_error"}
         ) from exc
 
     runtime_state.record(target_model, "errors")
-    record_rotator_event("error", model=target_model)
+    _record_request_rotator_event(
+        "error", model=target_model, request_ctx=request_ctx
+    )
     logger.error("请求处理发生未捕获异常: %s", exc)
     logger.debug("异常堆栈详情:", exc_info=True)
     raise HTTPException(
@@ -579,9 +858,21 @@ async def generate(
     last_error: Exception | None = None
     auth_manager = Auth403RetryManager()
     total_attempts = MAX_RETRIES + AUTH_403_MAX_RETRIES
+    ordinary_attempt = 0
+    request_ctx: SessionContext | None = None
 
     for attempt in range(total_attempts):
-        await ensure_active_account(attempt, model=model_path)
+        # 403 重试单独计数,普通失败(429/传输/登录失效)共用 MAX_RETRIES 预算,
+        # 两类预算互不挤占(上游 fcdc53e/PR #21 语义)
+        if ordinary_attempt >= MAX_RETRIES:
+            break
+        ensured_ctx = await ensure_active_account(attempt, model=model_path)
+        effective_ctx = auth_manager.pinned_ctx or (
+            ensured_ctx
+            if isinstance(ensured_ctx, SessionContext)
+            else _request_context_snapshot(client)
+        )
+        request_ctx = effective_ctx
         normalized: NormalizedGeminiRequest | None = None
         try:
             normalized = normalize_gemini_request(req, model_path)
@@ -594,13 +885,19 @@ async def generate(
                 total_attempts,
             )
 
-            # ATG empty-response retry: a fully empty (collapsed) upstream result
-            # is re-sent up to cfg.empty_retries times. This layer never switches
-            # accounts; it only re-sends within the current attempt.
-            max_empty = atg.cfg.empty_retries if (atg.enabled and tool_name) else 0
-            output: ModelOutput | None = None
-            for empty_attempt in range(max_empty + 1):
-                output = await client.generate_content(
+            force_recreate = auth_manager.force_recreate_signer
+            auth_manager.force_recreate_signer = False
+            prepared = auth_manager.current_prepared
+            if (
+                prepared is not None
+                and not force_recreate
+                and not _is_prepared_binding_current(prepared)
+            ):
+                # 切号、禁用或凭据更新后不能重放缓存签名
+                logger.info("缓存签名的账户绑定已变化，重新准备请求")
+                prepared = None
+            if prepared is None or force_recreate:
+                prepared = await client.prepare_request(
                     model=normalized.model,
                     contents=normalized.contents,
                     system_instruction_content=normalized.system_instruction,
@@ -612,11 +909,22 @@ async def generate(
                     top_k=normalized.top_k,
                     max_tokens=normalized.max_tokens,
                     generation_config_overrides=normalized.generation_config_overrides,
-                    prepared=auth_manager.current_prepared,
-                    force_recreate_signer=auth_manager.force_recreate_signer,
+                    force_recreate_signer=force_recreate,
+                    ctx=effective_ctx,
                 )
-                auth_manager.force_recreate_signer = False
-                auth_manager.current_prepared = None
+            request_ctx = prepared.ctx or effective_ctx
+            auth_manager.current_prepared = prepared
+
+            # ATG empty-response retry: a fully empty (collapsed) upstream result
+            # is re-sent up to cfg.empty_retries times. This layer never switches
+            # accounts; it only re-sends within the current attempt.
+            max_empty = atg.cfg.empty_retries if (atg.enabled and tool_name) else 0
+            output: ModelOutput | None = None
+            for empty_attempt in range(max_empty + 1):
+                output = await client.generate_content(
+                    model=normalized.model,
+                    prepared=prepared,
+                )
                 if not (atg.enabled and tool_name):
                     break
                 if not _output_is_empty(output):
@@ -645,7 +953,12 @@ async def generate(
             final_fr = to_gemini_finish_reason(
                 output.candidates[0].finish_reason if output.candidates else None
             )
-            record_rotator_event("success", model=normalized.model, usage=output.usage)
+            _record_request_rotator_event(
+                "success",
+                model=normalized.model,
+                request_ctx=request_ctx,
+                usage=output.usage,
+            )
             runtime_state.record(
                 normalized.model,
                 "success",
@@ -669,27 +982,38 @@ async def generate(
             )
         except Exception as exc:
             last_error = exc
-            if isinstance(exc, AuthError):
+            if isinstance(exc, AuthError) and not isinstance(
+                exc,
+                (
+                    SessionExpiredError,
+                    AccountVerificationRequiredError,
+                    AccountRestrictedError,
+                ),
+            ):
                 target_m = normalized.model if normalized else model_path
-                if await auth_manager.handle_403(exc, model=target_m, client=client):
+                if await auth_manager.handle_403(
+                    exc, model=target_m, client=client, request_ctx=request_ctx
+                ):
                     continue
                 raise
             if await handle_attempt_exception(
                 exc,
-                attempt=attempt,
+                attempt=ordinary_attempt,
                 model_path=model_path,
                 normalized_model=normalized.model if normalized else None,
+                request_ctx=request_ctx,
             ):
+                # 普通预算只在这里消耗,403 重试不占用
+                ordinary_attempt += 1
+                auth_manager.current_prepared = None
+                auth_manager.pinned_ctx = None
                 continue
             raise
 
-    raise HTTPException(
-        429,
-        detail={
-            "message": f"All accounts reached daily quota for model '{model_path}'. Quota resets at 00:00 PST.",
-            "type": "rate_limit_exceeded",
-        },
-    ) from last_error
+    # 预算耗尽时保留最后一次故障类型,不能统一伪装成配额耗尽
+    error = last_error or TransportError("Request retry budget exhausted.")
+    status_code, message, _ = classify_gemini_error_payload(error)
+    raise HTTPException(status_code, detail={"message": message}) from error
 
 
 async def stream_generation(
@@ -724,18 +1048,29 @@ async def stream_generation(
     max_empty = atg.cfg.empty_retries if (atg.enabled and tool_name) else 0
     auth_manager = Auth403RetryManager()
     total_attempts = MAX_RETRIES + AUTH_403_MAX_RETRIES
+    ordinary_attempt = 0
     normalized: NormalizedGeminiRequest | None = None
+    request_ctx: SessionContext | None = None
     stream_completed = False
     last_stream_error: Exception | None = None
 
     for stream_attempt in range(total_attempts):
+        # 403 重试单独计数,普通失败共用 MAX_RETRIES 预算(上游 fcdc53e/PR #21)
+        if ordinary_attempt >= MAX_RETRIES:
+            break
         has_yielded_data = False
         last_stream_error = None
         final_usage = None
         final_finish_reason = "STOP"
         latest_response_id = None
         buffered_thought_sig = None
-        await ensure_active_account(stream_attempt, model=model_path)
+        ensured_ctx = await ensure_active_account(stream_attempt, model=model_path)
+        effective_ctx = auth_manager.pinned_ctx or (
+            ensured_ctx
+            if isinstance(ensured_ctx, SessionContext)
+            else _request_context_snapshot(client)
+        )
+        request_ctx = effective_ctx
         normalized = normalize_gemini_request(effective_req, model_path)
         # Fresh per-attempt unwrapper: a retry must not carry stale
         # buffered/consumed state from the previous attempt.
@@ -749,50 +1084,108 @@ async def stream_generation(
         while True:
             produced_content = False
             try:
-                async for event_type, text in client.stream_generate_content(
-                    model=normalized.model,
-                    contents=normalized.contents,
-                    system_instruction_content=normalized.system_instruction,
-                    tools=normalized.tools,
-                    tool_config=normalized.tool_config,
-                    safety_settings=normalized.safety_settings,
-                    temperature=normalized.temperature,
-                    top_p=normalized.top_p,
-                    top_k=normalized.top_k,
-                    max_tokens=normalized.max_tokens,
-                    generation_config_overrides=normalized.generation_config_overrides,
-                    prepared=auth_manager.current_prepared,
-                    force_recreate_signer=auth_manager.force_recreate_signer,
+                force_recreate = auth_manager.force_recreate_signer
+                auth_manager.force_recreate_signer = False
+                prepared = auth_manager.current_prepared
+                if (
+                    prepared is not None
+                    and not force_recreate
+                    and not _is_prepared_binding_current(prepared)
                 ):
-                    auth_manager.force_recreate_signer = False
-                    if event_type == "usage":
-                        final_usage = text if isinstance(text, dict) else None
-                    elif event_type == "finish_reason":
-                        if text not in (None, 0, 22):
-                            final_finish_reason = (
-                                to_gemini_finish_reason(text)
-                                if isinstance(text, int)
-                                else str(text)
-                            )
-                        if (
+                    logger.info("缓存签名的账户绑定已变化，重新准备请求")
+                    prepared = None
+                if prepared is None or force_recreate:
+                    prepared = await client.prepare_request(
+                        model=normalized.model,
+                        contents=normalized.contents,
+                        system_instruction_content=normalized.system_instruction,
+                        tools=normalized.tools,
+                        tool_config=normalized.tool_config,
+                        safety_settings=normalized.safety_settings,
+                        temperature=normalized.temperature,
+                        top_p=normalized.top_p,
+                        top_k=normalized.top_k,
+                        max_tokens=normalized.max_tokens,
+                        generation_config_overrides=(
+                            normalized.generation_config_overrides
+                        ),
+                        force_recreate_signer=force_recreate,
+                        ctx=effective_ctx,
+                    )
+                request_ctx = prepared.ctx or effective_ctx
+                auth_manager.current_prepared = prepared
+                async with aclosing(
+                    client.stream_generate_content(
+                        model=normalized.model,
+                        prepared=prepared,
+                    )
+                ) as events:
+                    async for event_type, text in events:
+                        if event_type == "usage":
+                            final_usage = text if isinstance(text, dict) else None
+                        elif event_type == "finish_reason":
+                            if text not in (None, 0, 22):
+                                final_finish_reason = (
+                                    to_gemini_finish_reason(text)
+                                    if isinstance(text, int)
+                                    else str(text)
+                                )
+                            if (
+                                unwrapper is not None
+                                and final_finish_reason == "TOOL_CALLS"
+                                and unwrapper.should_remap_finish_reason()
+                            ):
+                                final_finish_reason = "STOP"
+                        elif event_type == "response_id":
+                            latest_response_id = str(text)
+                        elif event_type == "thought_signature":
+                            if buffered_thought_sig:
+                                # 连续的独立签名按到达顺序输出,不能互相覆盖
+                                # (上游 fcdc53e / tool roundtrip 语义)
+                                yield StreamEvent(
+                                    kind="thought_signature",
+                                    payload=buffered_thought_sig,
+                                    model=normalized.model,
+                                    response_id=latest_response_id,
+                                )
+                                has_yielded_data = True
+                            buffered_thought_sig = str(text)
+                        elif (
                             unwrapper is not None
-                            and final_finish_reason == "TOOL_CALLS"
-                            and unwrapper.should_remap_finish_reason()
+                            and event_type in _ATG_STREAM_EVENT_TYPES
                         ):
-                            final_finish_reason = "STOP"
-                    elif event_type == "response_id":
-                        latest_response_id = str(text)
-                    elif event_type == "thought_signature":
-                        buffered_thought_sig = str(text)
-                    elif (
-                        unwrapper is not None and event_type in _ATG_STREAM_EVENT_TYPES
-                    ):
-                        if text:
-                            produced_content = True
-                        for index, (out_type, out_text) in enumerate(
-                            unwrapper.process_event(event_type, text)
-                        ):
-                            if out_text:
+                            if text:
+                                produced_content = True
+                            for index, (out_type, out_text) in enumerate(
+                                unwrapper.process_event(event_type, text)
+                            ):
+                                if out_text:
+                                    has_yielded_data = True
+                                    if not logged_first_chunk:
+                                        logged_first_chunk = True
+                                        ttft_ms = (
+                                            time.perf_counter() - stream_start_time
+                                        ) * 1000
+                                        logger.info(
+                                            "流式响应开始推送: model=%s, 首包耗时=%.1fms",
+                                            normalized.model,
+                                            ttft_ms,
+                                        )
+                                yield StreamEvent(
+                                    kind=out_type,
+                                    payload=out_text,
+                                    model=normalized.model,
+                                    response_id=latest_response_id,
+                                    thought_signature=(
+                                        buffered_thought_sig if index == 0 else None
+                                    ),
+                                )
+                            buffered_thought_sig = None
+                        else:
+                            renderable = (
+                                event_type in _RENDERABLE_STREAM_EVENT_TYPES
+                            )
+                            if text and renderable:
                                 has_yielded_data = True
                                 if not logged_first_chunk:
                                     logged_first_chunk = True
@@ -805,48 +1198,38 @@ async def stream_generation(
                                         ttft_ms,
                                     )
                             yield StreamEvent(
-                                kind=out_type,
-                                payload=out_text,
+                                kind=event_type,
+                                payload=text,
                                 model=normalized.model,
                                 response_id=latest_response_id,
-                                thought_signature=(
-                                    buffered_thought_sig if index == 0 else None
-                                ),
+                                thought_signature=buffered_thought_sig,
                             )
-                        buffered_thought_sig = None
-                    else:
-                        if text:
-                            has_yielded_data = True
-                            if not logged_first_chunk:
-                                logged_first_chunk = True
-                                ttft_ms = (
-                                    time.perf_counter() - stream_start_time
-                                ) * 1000
-                                logger.info(
-                                    "流式响应开始推送: model=%s, 首包耗时=%.1fms",
-                                    normalized.model,
-                                    ttft_ms,
-                                )
-                        yield StreamEvent(
-                            kind=event_type,
-                            payload=text,
-                            model=normalized.model,
-                            response_id=latest_response_id,
-                            thought_signature=buffered_thought_sig,
-                        )
-                        # 仅有实际载荷的事件才消费签名缓冲;"done"/None 载荷
-                        # 事件不能清空,否则尾随独立签名丢失(上游 Issue #15)
-                        if text:
-                            buffered_thought_sig = None
+                            # 仅有实际载荷且可渲染的事件才消费签名缓冲;
+                            # "done"/None 载荷与未知类型事件不能清空,否则
+                            # 尾随独立签名丢失(上游 Issue #15 / fcdc53e)
+                            if text and renderable:
+                                buffered_thought_sig = None
                 auth_manager.current_prepared = None
             except Exception as exc:
                 last_stream_error = exc
-                if isinstance(exc, AuthError) and not has_yielded_data:
+                if (
+                    isinstance(exc, AuthError)
+                    and not isinstance(
+                        exc,
+                        (
+                            SessionExpiredError,
+                            AccountVerificationRequiredError,
+                            AccountRestrictedError,
+                        ),
+                    )
+                    and not has_yielded_data
+                ):
                     target_m = normalized.model if normalized else model_path
                     if await auth_manager.handle_403(
                         exc,
                         model=target_m,
                         client=client,
+                        request_ctx=request_ctx,
                         has_yielded_data=has_yielded_data,
                     ):
                         retry_outer = True
@@ -854,11 +1237,15 @@ async def stream_generation(
                     raise
                 if await handle_attempt_exception(
                     exc,
-                    attempt=stream_attempt,
+                    attempt=ordinary_attempt,
                     model_path=model_path,
                     normalized_model=normalized.model if normalized else None,
                     has_yielded_data=has_yielded_data,
+                    request_ctx=request_ctx,
                 ):
+                    ordinary_attempt += 1
+                    auth_manager.current_prepared = None
+                    auth_manager.pinned_ctx = None
                     retry_outer = True
                     break
                 raise
@@ -917,7 +1304,9 @@ async def stream_generation(
         )
         buffered_thought_sig = None
     target_model = normalized.model if normalized else model_path
-    record_rotator_event("success", model=target_model, usage=final_usage)
+    _record_request_rotator_event(
+        "success", model=target_model, request_ctx=request_ctx, usage=final_usage
+    )
     if normalized is not None:
         runtime_state.record(
             normalized.model,

@@ -43,8 +43,14 @@ def request_runtime(monkeypatch):
     record = MagicMock()
     events = MagicMock()
     monkeypatch.setattr(gemini, "ensure_active_account", AsyncMock())
+    from aistudio_api.application import generation_core as _gcore
+    monkeypatch.setattr(_gcore, "ensure_active_account", AsyncMock())
     monkeypatch.setattr(gemini, "try_switch_account", switch)
+    from aistudio_api.application import generation_core as _gcore
+    monkeypatch.setattr(_gcore, "try_switch_account", switch)
     monkeypatch.setattr(gemini, "record_rotator_event", events)
+    from aistudio_api.application import generation_core as _gcore
+    monkeypatch.setattr(_gcore, "record_rotator_event", events)
     monkeypatch.setattr(gemini.runtime_state, "account_service", None)
     monkeypatch.setattr(gemini.runtime_state, "rotator", None)
     monkeypatch.setattr(gemini.runtime_state, "record", record)

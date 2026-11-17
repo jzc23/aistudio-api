@@ -6,7 +6,7 @@ from collections.abc import AsyncIterator, Mapping
 from typing import TYPE_CHECKING, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import ValidationError
 
 from aistudio_api.api.dependencies import get_client, get_runtime_state
@@ -111,11 +111,14 @@ async def chat_completions(
         # 响应头"直接 524(ATG 静默/空响应重试/切号期间首事件可能 >100s)。
         # 代价是早期错误改为流内 SSE 错误事件(与 Gemini 路径行为一致)。
         async def rendered_chunks() -> AsyncIterator[str]:
+            from contextlib import aclosing
+
             try:
-                async for event in iterator:
-                    rendered = renderer.render(event)
-                    if rendered:
-                        yield rendered
+                async with aclosing(iterator) as stream:
+                    async for event in stream:
+                        rendered = renderer.render(event)
+                        if rendered:
+                            yield rendered
                 tail = renderer.close()
                 if tail:
                     yield tail
@@ -125,17 +128,24 @@ async def chat_completions(
                 yield openai_sse_error(exc)
 
         # 心跳保活:静默超过 15s 输出 SSE 注释行(SSE 规范注释,OpenAI SDK
-        # 会忽略),防止网关空闲超时 504(ATG 合成通道首段内容前常长静默)
+        # 会忽略),防止网关空闲超时 504(ATG 合成通道首段内容前常长静默);
+        # aclosing 保证关闭链确定性传播到传输层
         async def event_stream() -> AsyncIterator[str]:
+            from contextlib import aclosing
+
             from aistudio_api.api.sse_heartbeat import heartbeat_sse
 
-            async for chunk in heartbeat_sse(rendered_chunks()):
-                yield chunk
+            async with aclosing(heartbeat_sse(rendered_chunks())) as wrapped:
+                async for chunk in wrapped:
+                    yield chunk
 
-        return StreamingResponse(
+        # ASGI 生命周期绑定:客户端断开时关闭迭代器,aclosing 链直达传输层
+        # (上游 fcdc53e 语义)
+        from aistudio_api.api.streaming_response import RequestStreamingResponse
+
+        return RequestStreamingResponse(
             event_stream(),
             media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
     except Exception as exc:
         return format_error_response(exc, "openai")

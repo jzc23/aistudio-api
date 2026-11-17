@@ -57,6 +57,8 @@ async def test_sse_close_awaits_http_response_through_real_gateway(monkeypatch):
         ),
     )
     monkeypatch.setattr(gemini, "ensure_active_account", AsyncMock())
+    from aistudio_api.application import generation_core as _gcore
+    monkeypatch.setattr(_gcore, "ensure_active_account", AsyncMock())
     monkeypatch.setattr(gemini.runtime_state, "account_service", None)
     req = GeminiGenerateContentRequest.model_validate(
         {"contents": [{"role": "user", "parts": [{"text": "虚构输入"}]}]}
@@ -119,6 +121,8 @@ async def test_nonstream_client_cancellation_cleans_generation(monkeypatch, keep
         ),
     )
     monkeypatch.setattr(gemini, "ensure_active_account", AsyncMock())
+    from aistudio_api.application import generation_core as _gcore
+    monkeypatch.setattr(_gcore, "ensure_active_account", AsyncMock())
     monkeypatch.setattr(gemini.runtime_state, "account_service", None)
     monkeypatch.setattr(gemini.runtime_state, "rotator", None)
 
@@ -207,6 +211,8 @@ async def test_response_lifecycle_awaits_cleanup_before_return(
         ),
     )
     monkeypatch.setattr(gemini, "ensure_active_account", AsyncMock())
+    from aistudio_api.application import generation_core as _gcore
+    monkeypatch.setattr(_gcore, "ensure_active_account", AsyncMock())
     monkeypatch.setattr(gemini.runtime_state, "account_service", None)
     monkeypatch.setattr(gemini.runtime_state, "rotator", None)
 
@@ -293,6 +299,8 @@ async def test_stream_iterator_close_awaits_inner_generator_finally(monkeypatch)
         {"contents": [{"role": "user", "parts": [{"text": "虚构输入"}]}]}
     )
     monkeypatch.setattr(gemini, "ensure_active_account", AsyncMock())
+    from aistudio_api.application import generation_core as _gcore
+    monkeypatch.setattr(_gcore, "ensure_active_account", AsyncMock())
     monkeypatch.setattr(gemini.runtime_state, "account_service", None)
 
     closed = asyncio.Event()

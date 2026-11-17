@@ -40,6 +40,8 @@ def _build_client() -> httpx.AsyncClient:
 def ready_account_boundary(monkeypatch: pytest.MonkeyPatch) -> None:
     # 只隔离账号就绪与外部签名边界，保留真实 SDK、ASGI 与业务序列化。
     monkeypatch.setattr(gemini, "ensure_active_account", AsyncMock())
+    from aistudio_api.application import generation_core as _gcore
+    monkeypatch.setattr(_gcore, "ensure_active_account", AsyncMock())
     monkeypatch.setattr(gemini.runtime_state, "account_service", None)
     monkeypatch.setattr(gemini.runtime_state, "rotator", None)
 

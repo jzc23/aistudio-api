@@ -30,6 +30,8 @@ def ready_stream_client(monkeypatch) -> MagicMock:
 
     # 协议测试隔离账号调度与外部签名，保留实际请求规范化及 SSE 序列化。
     monkeypatch.setattr(gemini, "ensure_active_account", AsyncMock())
+    from aistudio_api.application import generation_core as _gcore
+    monkeypatch.setattr(_gcore, "ensure_active_account", AsyncMock())
     monkeypatch.setattr(gemini.runtime_state, "account_service", None)
     client = MagicMock(spec=AIStudioClient)
     client.prepare_request = AsyncMock(

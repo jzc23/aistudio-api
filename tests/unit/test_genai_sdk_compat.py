@@ -23,6 +23,8 @@ from aistudio_api.infrastructure.gateway.session import SessionContext
 def mock_client(monkeypatch) -> MagicMock:
     # 仅替换账号和外部签名边界，官方 SDK 到 ASGI 的协议链路保持真实。
     monkeypatch.setattr(gemini, "ensure_active_account", AsyncMock())
+    from aistudio_api.application import generation_core as _gcore
+    monkeypatch.setattr(_gcore, "ensure_active_account", AsyncMock())
     monkeypatch.setattr(gemini.runtime_state, "account_service", None)
     monkeypatch.setattr(gemini.runtime_state, "rotator", None)
     client = MagicMock()
@@ -357,7 +359,9 @@ async def test_genai_sdk_tool_config_forwarding(mock_client: MagicMock) -> None:
                 ),
             )
             assert mock_client.generate_content.called
-            call_kwargs = mock_client.generate_content.call_args.kwargs
+            # 规范化参数经 prepare_request 进入(generation_core 显式
+            # prepare 后仅传 prepared 给 generate_content)
+            call_kwargs = mock_client.prepare_request.call_args.kwargs
             assert "tool_config" in call_kwargs
             assert call_kwargs["tool_config"] == [None, [2]]
     finally:

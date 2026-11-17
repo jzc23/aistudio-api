@@ -58,6 +58,8 @@ async def test_streaming_trailing_standalone_thought_signature_not_dropped(monke
     """Issue #15: standalone thoughtSignature chunk right before done must be emitted."""
     # 此处验证签名尾包，账号就绪边界使用离线桩以进入真实 SSE 处理逻辑。
     monkeypatch.setattr(gemini, "ensure_active_account", AsyncMock())
+    from aistudio_api.application import generation_core as _gcore
+    monkeypatch.setattr(_gcore, "ensure_active_account", AsyncMock())
     monkeypatch.setattr(gemini.runtime_state, "account_service", None)
     mock_client = MagicMock(spec=AIStudioClient)
     mock_client.prepare_request = AsyncMock(

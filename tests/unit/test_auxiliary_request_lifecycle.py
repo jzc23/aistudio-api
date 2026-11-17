@@ -66,8 +66,15 @@ def _decision_success() -> dict[str, object]:
 def ready_client(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
     # 只替代账号就绪及上游请求边界，使用真实业务处理器与响应模型。
     monkeypatch.setattr(gemini, "ensure_active_account", AsyncMock())
-    monkeypatch.setattr(gemini, "try_switch_account", AsyncMock(return_value=True))
+    from aistudio_api.application import generation_core as _gcore
+    monkeypatch.setattr(_gcore, "ensure_active_account", AsyncMock())
+    _shared_switch = AsyncMock(return_value=True)
+    monkeypatch.setattr(gemini, "try_switch_account", _shared_switch)
+    from aistudio_api.application import generation_core as _gcore
+    monkeypatch.setattr(_gcore, "try_switch_account", _shared_switch)
     monkeypatch.setattr(gemini, "record_rotator_event", MagicMock())
+    from aistudio_api.application import generation_core as _gcore
+    monkeypatch.setattr(_gcore, "record_rotator_event", MagicMock())
     monkeypatch.setattr(gemini.runtime_state, "record", MagicMock())
     monkeypatch.setattr(gemini.runtime_state, "account_service", None)
     monkeypatch.setattr(gemini.runtime_state, "rotator", None)
@@ -317,8 +324,13 @@ async def test_count_tokens_error_uses_pre_request_account_snapshot(
     rotator = MagicMock()
     monkeypatch.setattr(gemini.runtime_state, "account_service", service)
     monkeypatch.setattr(gemini.runtime_state, "rotator", rotator)
-    monkeypatch.setattr(gemini, "try_switch_account", AsyncMock(return_value=False))
+    _shared_switch = AsyncMock(return_value=False)
+    monkeypatch.setattr(gemini, "try_switch_account", _shared_switch)
+    from aistudio_api.application import generation_core as _gcore
+    monkeypatch.setattr(_gcore, "try_switch_account", _shared_switch)
     monkeypatch.setattr(gemini, "record_rotator_event", record_rotator_event)
+    from aistudio_api.application import generation_core as _gcore
+    monkeypatch.setattr(_gcore, "record_rotator_event", record_rotator_event)
     ready_client.session.active_context = _context(tmp_path, first)
 
     async def request(**_kwargs: object) -> dict[str, object]:
@@ -370,8 +382,13 @@ async def test_count_tokens_unknown_deleted_or_stale_source_never_penalizes_new_
     rotator = MagicMock()
     monkeypatch.setattr(gemini.runtime_state, "account_service", service)
     monkeypatch.setattr(gemini.runtime_state, "rotator", rotator)
-    monkeypatch.setattr(gemini, "try_switch_account", AsyncMock(return_value=False))
+    _shared_switch = AsyncMock(return_value=False)
+    monkeypatch.setattr(gemini, "try_switch_account", _shared_switch)
+    from aistudio_api.application import generation_core as _gcore
+    monkeypatch.setattr(_gcore, "try_switch_account", _shared_switch)
     monkeypatch.setattr(gemini, "record_rotator_event", record_rotator_event)
+    from aistudio_api.application import generation_core as _gcore
+    monkeypatch.setattr(_gcore, "record_rotator_event", record_rotator_event)
     ready_client.session.active_context = (
         SessionContext(cookies={"SID": "synthetic_sid"})
         if source == "unknown"
@@ -410,7 +427,10 @@ async def test_count_tokens_old_401_does_not_disable_reimported_generation(
 ) -> None:
     service, first, _second, _active = _account_service()
     monkeypatch.setattr(gemini.runtime_state, "account_service", service)
-    monkeypatch.setattr(gemini, "try_switch_account", AsyncMock(return_value=False))
+    _shared_switch = AsyncMock(return_value=False)
+    monkeypatch.setattr(gemini, "try_switch_account", _shared_switch)
+    from aistudio_api.application import generation_core as _gcore
+    monkeypatch.setattr(_gcore, "try_switch_account", _shared_switch)
     ready_client.session.active_context = _context(tmp_path, first)
     calls = 0
 
@@ -546,6 +566,8 @@ async def test_completed_account_a_never_clears_account_b_penalties(
     monkeypatch.setattr(gemini.runtime_state, "account_service", service)
     monkeypatch.setattr(gemini.runtime_state, "rotator", rotator)
     monkeypatch.setattr(gemini, "record_rotator_event", record_rotator_event)
+    from aistudio_api.application import generation_core as _gcore
+    monkeypatch.setattr(_gcore, "record_rotator_event", record_rotator_event)
     prepared = PreparedRequest(
         url="https://example.test/rpc",
         headers={},
@@ -659,7 +681,11 @@ async def test_preparation_failure_keeps_original_account_snapshot(
     monkeypatch.setattr(gemini.runtime_state, "account_service", service)
     monkeypatch.setattr(gemini.runtime_state, "rotator", rotator)
     monkeypatch.setattr(gemini, "try_switch_account", switch)
+    from aistudio_api.application import generation_core as _gcore
+    monkeypatch.setattr(_gcore, "try_switch_account", switch)
     monkeypatch.setattr(gemini, "record_rotator_event", record_rotator_event)
+    from aistudio_api.application import generation_core as _gcore
+    monkeypatch.setattr(_gcore, "record_rotator_event", record_rotator_event)
     ready_client.session.active_context = _context(tmp_path, first)
     prepares = 0
 

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncGenerator
+from contextlib import suppress
 
 DEFAULT_HEARTBEAT_INTERVAL = 15.0
 HEARTBEAT_COMMENT = "keep-alive"
@@ -54,6 +55,13 @@ async def heartbeat_sse(
     finally:
         if pending is not None and not pending.done():
             pending.cancel()
+        # 客户端断开时(外层 RequestStreamingResponse 调 aclose)显式关闭底层
+        # 生成器,让 aclosing 清理链(渲染器 -> 传输层)同步释放上游连接;
+        # 正常结束时底层已自行走完,aclose 是幂等空操作
+        aclose = getattr(source, "aclose", None)
+        if aclose is not None:
+            with suppress(Exception):
+                await aclose()
 
 
 __all__ = [
