@@ -3,7 +3,7 @@
 <p align="center">
   <a href="https://github.com/DeconstructedCube/aistudio-api"><img src="https://img.shields.io/badge/API-Gemini%20v1beta-4285F4?style=flat-square&logo=google" alt="Gemini API"></a>
   <a href="https://hub.docker.com/r/bedrockblock/aistudio-api"><img src="https://img.shields.io/badge/Docker-bedrockblock%2Faistudio--api-2496ED?style=flat-square&logo=docker" alt="Docker Hub"></a>
-  <a href="https://deepwiki.com/DeconstructedCube/aistudio-api"><img src="https://img.shields.io/badge/DeepWiki-DeconstructedCube%2Faistudio--api-5B68E4?style=flat-square&logo=data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACwAAAAyCAYAAAAnWDnqAAAAAXNSR0IArs4c6QAAA05JREFUaEPtmUtyEzEQhtWTQyQLHNak2AB7ZnyXZMEjXMGeK/AIi+QuHrMnbChYY7MIh8g01fJoopFb0uhhEqqcbWTp06/uv1saEDv4O3n3dV60RfP947Mm9/SQc0ICFQgzfc4CYZoTPAswgSJCCUJUnAAoRHOAUOcATwbmVLWdGoH//PB8mnKqScAhsD0kYP3j/Yt5LPQe2KvcXmGvRHcDnpxfL2zOYJ1mFwrryWTz0advv1Ut4CJgf5uhDuDj5eUcAUoahrdY/56ebRWeraTjMt/00Sh3UDtjgHtQNHwcRGOC98BJEAEymycmYcWwOprTgcB6VZ5JK5TAJ+fXGLBm3FDAmn6oPPjR4rKCAoJCal2eAiQp2x0vxTPB3ALO2CRkwmDy5WohzBDwSEFKRwPbknEggCPB/imwrycgxX2NzoMCHhPkDwqYMr9tRcP5qNrMZHkVnOjRMWwLCcr8ohBVb1OMjxLwGCvjTikrsBOiA6fNyCrm8V1rP93iVPpwaE+gO0SsWmPiXB+jikdf6SizrT5qKasx5j8ABbHpFTx+vFXp9EnYQmLx02h1QTTrl6eDqxLnGjporxl3NL3agEvXdT0WmEost648sQOYAeJS9Q7bfUVoMGnjo4AZdUMQku50McDcMWcBPvr0SzbTAFDfvJqwLzgxwATnCgnp4wDl6Aa+Ax283gghmj+vj7feE2KBBRMW3FzOpLOADl0Isb5587h/U4gGvkt5v60Z1VLG8BhYjbzRwyQZemwAd6cCR5/XFWLYZRIMpX39AR0tjaGGiGzLVyhse5C9RKC6ai42ppWPKiBagOvaYk8lO7DajerabOZP46Lby5wKjw1HCRx7p9sVMOWGzb/vA1hwiWc6jm3MvQDTogQkiqIhJV0nBQBTU+3okKCFDy9WwferkHjtxib7t3xIUQtHxnIwtx4mpg26/HfwVNVDb4oI9RHmx5WGelRVlrtiw43zboCLaxv46AZeB3IlTkwouebTr1y2NjSpHz68WNFjHvupy3q8TFn3Hos2IAk4Ju5dCo8B3wP7VPr/FGaKiG+T+v+TQqIrOqMTL1VdWV1DdmcbO8KXBz6esmYWYKPwDL5b5FA1a0hwapHiom0r/cKaoqr+27/XcrS5UwSMbQAAAABJRU5ErkJggg==" alt="DeepWiki"></a>
+  <a href="https://deepwiki.com/DeconstructedCube/aistudio-api"><img src="https://img.shields.io/badge/DeepWiki-Docs-5B68E4?style=flat-square" alt="DeepWiki"></a>
   <a href="https://fastapi.tiangolo.com/"><img src="https://img.shields.io/badge/Framework-FastAPI-009688?style=flat-square&logo=fastapi" alt="FastAPI"></a>
   <a href="https://vuejs.org/"><img src="https://img.shields.io/badge/Frontend-Vue%203%20%2B%20Vite-4FC08D?style=flat-square&logo=vuedotjs" alt="Vue 3"></a>
   <a href="https://docs.astral.sh/uv/"><img src="https://img.shields.io/badge/Python-3.11%2B%20%7C%20uv-261230?style=flat-square&logo=python" alt="Python uv"></a>
@@ -29,6 +29,8 @@
   - [Windows](#windows)
   - [Linux / macOS](#linux--macos)
   - [Docker Deployment](#docker-deployment)
+- [Obtaining & Importing Account Credentials (Cookies)](#obtaining--importing-account-credentials-cookies)
+- [Third-Party Client Setup Guide (NextChat / Cherry Studio)](#third-party-client-setup-guide-nextchat--cherry-studio--one-api)
 - [Configuration & Environment Variables](#configuration--environment-variables)
 - [API Usage Examples](#api-usage-examples)
   - [cURL](#curl)
@@ -52,8 +54,8 @@
 | **Downstream Parameter Fault Tolerance** | `drop_unsupported_params` automatically drops unsupported safety categories (e.g. `HARM_CATEGORY_CIVIC_INTEGRITY`) and tools to prevent 400 errors |
 | **Multi-Account Probing** | Extracts and verifies sub-accounts (`u/0`, `u/1`...) automatically when importing a multi-session Cookie |
 | **Built-in Tools** | Supports official tools such as Google Search, Google Maps, URL Context, and Code Execution sandbox |
-| **Dual-Track Signing & Feature Alignment** | Browserless architecture supporting standalone Go signer (SpiderMonkey 152) or remote NodeVM signers with matched User-Agent/header binding and 5-stage 403 recovery |
-| **Web Management Console** | Built-in web dashboard for account management (groups, presets, text/JSON bundle imports), live request metrics, WAA signer switching, logging/dump controls, and `config.yaml` hot reloading |
+| **Local WAA IPC Signing** | Browserless architecture powered by local Go `waa-signer` (SpiderMonkey 152) over multiplexed stdio NDJSON IPC, aligned with Firefox 152 User-Agent/headers and 5-stage 403 recovery |
+| **Web Management Console** | Built-in web dashboard for account management (groups, presets, text/JSON bundle imports), live request metrics, logging/dump controls, and `config.yaml` hot reloading |
 > [!NOTE]
 > **Memory Footprint**: Operating completely browserless, resident memory is only ~35 - 50 MB with sub-second cold start, running smoothly even on lightweight mobile Termux environments or entry-level servers.
 ## Architecture & Documentation
@@ -71,8 +73,7 @@
 └───────────────────────────┼────────────────────────────┘
                             │ Proof Mint & HTTP/2 Stream
 ┌───────────────────────────▼────────────────────────────┐
-│       Browserless WAA Engine (waa-signer / Remote NodeVM)     │
-│       Async Connection Pooling (HTTPStreamTransport)   │
+│       Browserless WAA Engine (waa-signer via stdio IPC)│
 └───────────────────────────┬────────────────────────────┘
                             │ HTTPS / RPC
 ┌───────────────────────────▼────────────────────────────┐
@@ -92,67 +93,41 @@ Technical reference documentation:
 
 ## Quick Start
 
-> [!IMPORTANT]
-> **About WAA Signer Services (Local Native vs Remote Node)**:
-> - **Local Native Engine (Highly Recommended)**: Embedded SpiderMonkey 152 with Firefox 152 host environment. Mints proofs in 10-30 ms, consumes only ~35-50 MB RAM, and runs 100% locally with zero external network dependencies. Run a one-time build command before startup (detailed below per platform).
-> - **Remote Signer Node (Automatic Fallback)**: If the local signer binary has not been built yet, the server **automatically and seamlessly falls back** to the public remote signing node (`https://waa.spinsnow.fun`) for out-of-the-box operation (subject to remote network latency and availability).
+Except for Docker, all native platforms use a unified one-command installer and launcher that automatically configures Python 3.11+, `uv`, Go, Zig, SpiderMonkey static libraries, and builds `waa-signer`.
 
 ### Android (Termux)
 
 > [!TIP]
 > **Download Notice**: Always install Termux from [F-Droid](https://f-droid.org/packages/com.termux/) or [GitHub Releases](https://github.com/termux/termux-app/releases). **Do NOT install from the Google Play Store** (the Play Store build is obsolete and will produce repository update errors).
 
-Open Termux and run the following commands step by step:
+Open Termux and run:
 
 ```bash
-# Step 1: Update Termux environment and install git
 pkg update -y && pkg install -y git
-
-# Step 2: Clone repository and enter directory
 git clone https://github.com/DeconstructedCube/aistudio-api.git
 cd aistudio-api
-
-# Step 3: Initialize Python environment & sync dependencies
-bash scripts/setup-env.sh
-uv sync
-
-# Step 4 (Highly Recommended): Build local native signer service
-# Prerequisite: pkg install -y golang zig
-bash waa-signer/build.sh
-
-# Step 5: Start server
-uv run python main.py server --port 8080
+bash install.sh
+bash start.sh
 ```
 
 Once started:
 1. Open your phone's browser and go to **`http://localhost:8080`** to access the Web Console;
-2. Navigate to **Accounts**, paste your Google account Cookies or import a bundle to start using the API;
-3. **Background Persistence Tip**: Pull down Android's notification bar, tap `Acquire Wakelock` on Termux's notification, and disable battery optimization for Termux in phone system settings to prevent sleep kills.
+2. Follow the [Cookie Import Guide](#obtaining--importing-account-credentials-cookies) below to import your credentials;
+3. **Background Persistence Tip**: Pull down Android's notification bar, tap `Acquire Wakelock` on Termux's notification, and disable battery optimization for Termux in phone system settings.
 
 ---
 
 ### Windows
 
-Prerequisite: [Python 3.11+](https://www.python.org/downloads/) installed (check `Add python.exe to PATH` during setup).
+Recommended: [Git](https://git-scm.com/) installed (or download and extract the repository ZIP).
 
-Open PowerShell or Windows Terminal:
+Double-click **`install.bat`** (or run `.\install.bat`) to set up dependencies and compile `waa-signer.exe` automatically, then double-click **`start.bat`** (or run `.\start.bat`) to launch:
 
 ```bat
-# Step 1: Install uv package manager
-powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
-
-# Step 2: Clone repository and enter directory
 git clone https://github.com/DeconstructedCube/aistudio-api.git
 cd aistudio-api
-
-# Step 3: Sync dependencies
-uv sync
-
-# Step 4 (Highly Recommended): Build local native signer service (Recommended: winget install GoLang.Go zig.zig)
-.\waa-signer\build.bat
-
-# Step 5: Start server
-uv run python main.py server --port 8080
+.\install.bat
+.\start.bat
 ```
 
 Open **`http://localhost:8080`** in your browser to access the Web Console.
@@ -161,26 +136,14 @@ Open **`http://localhost:8080`** in your browser to access the Web Console.
 
 ### Linux / macOS
 
-Open a terminal and run:
-
 ```bash
-# Step 1: Install uv package manager
-curl -LsSf https://astral.sh/uv/install.sh | sh
-
-# Step 2: Clone repository and enter directory
 git clone https://github.com/DeconstructedCube/aistudio-api.git
 cd aistudio-api
-
-# Step 3: Sync dependencies
-uv sync
-
-# Step 4 (Highly Recommended): Build local native signer service
-# Prerequisite: Go 1.22+ and zig (or clang / gcc)
-bash waa-signer/build.sh
-
-# Step 5: Start server
-uv run python3 main.py server --port 8080
+bash install.sh
+bash start.sh
 ```
+
+> Useful flags: `bash install.sh --start` (launch right after build), `bash install.sh --proxy http://127.0.0.1:7890`, `bash install.sh --rebuild`.
 
 Open **`http://localhost:8080`** in your browser to access the Web Console.
 
@@ -208,6 +171,40 @@ Open **`http://localhost:8080`** in your browser to access the Web Console.
 
 ---
 
+## Obtaining & Importing Account Credentials (Cookies)
+
+This service does not store your Google account password. It uses standard web session credentials with automated periodic Cookie rotation.
+
+### Step 1: Obtain Google AI Studio Cookies
+
+1. Visit and log in to [Google AI Studio](https://aistudio.google.com/) in your browser, ensuring you can reach the chat workspace;
+2. Install the free **Cookie-Editor** browser extension (available on Chrome Web Store, Edge Add-ons, or Firefox Add-ons);
+3. On the `aistudio.google.com` tab, click the Cookie-Editor extension icon;
+4. Click **Export** in the bottom-right and select **Export as JSON** (or Export as Header); the data is automatically copied to your clipboard.
+
+### Step 2: Import into Web Console
+
+1. Access the Web Console (default `http://localhost:8080`);
+2. Click **Accounts** in the left sidebar;
+3. Click **"+ Import Credentials"** in the top right;
+4. Paste your clipboard data into the input box and click **Confirm Import**;
+5. The service will automatically test connectivity and probe any multi-login sub-accounts (`u/0`, `u/1`...) to register them for load balancing.
+
+---
+
+## Third-Party Client Setup Guide (NextChat / Cherry Studio / One API)
+
+> [!WARNING]
+> **Strictly Gemini Protocol Required**!
+> This project is a dedicated reverse proxy strictly adhering to the Google Gemini API specification. It **does NOT provide OpenAI-compatible routes** (such as `/v1/chat/completions`). In all third-party clients, you MUST select **Google Gemini** (or **Gemini**) as the model provider type.
+
+| Setting | Value | Description |
+|---|---|---|
+| **Provider / Model Type** | **Google Gemini** | Do NOT select OpenAI or custom OpenAI formats |
+| **API Base URL** | `http://localhost:8080` | If the client mandates a version prefix, enter `http://localhost:8080/v1beta` |
+| **API Key** | Any string (e.g. `aistudio-api`) | If `api_keys` is not set in `config.yaml`, any non-empty string works; otherwise enter your configured key |
+| **Supported Models** | `gemini-3.7-flash`<br/>`gemini-3.8-flash`<br/>`gemini-4-argon`<br/>`gemini-3.1-flash-image` | Supports all active models discovered dynamically from Google AI Studio |
+
 ## Configuration & Environment Variables
 
 Open `http://localhost:8080` in your browser to access the Web Console.
@@ -225,7 +222,6 @@ Open `http://localhost:8080` in your browser to access the Web Console.
 | `AISTUDIO_CONFIG_FILE` | string | `config.yaml` | Path to model rules and default tools configuration YAML |
 | `AISTUDIO_PERSIST_STATS` | bool | `true` | Persist request and token usage metrics across service restarts |
 | `AISTUDIO_PERSIST_ROTATOR` | bool | `true` | Persist account 429 rate limit dates & cooldowns across restarts |
-| `AISTUDIO_PROOF_SERVER_URL` | string | `https://waa.spinsnow.fun` | Fallback proof server URL; active signer & bound User-Agent are primarily configured in `config.yaml` (`waa.active_server`, falling back to `remote_spinsnow` if local binary is absent) |
 | `AISTUDIO_DEFAULT_TEXT_MODEL` | string | `gemini-3.7-flash` | Default text model |
 | `AISTUDIO_TIMEZONE` | string | Auto | Wire protocol timezone (`America/Los_Angeles` by default) |
 | `AISTUDIO_DUMP_REQUESTS` | bool | `false` | Dump API request/response exchanges to console logs (enabled via `DEBUG=1`) |
@@ -381,7 +377,7 @@ The service includes a built-in static Web Console served at `http://localhost:8
 
 - **Dashboard**: Real-time view of service health, per-model request stats, success rates, and rate-limit cooldown status.
 - **Accounts**: Import Cookie credentials (single text or bundle files), auto-probe multiple accounts, organize groups and one-click presets, switch the active account, or reset rate limits.
-- **Settings**: Online editor for `config.yaml` with instant hot-reloading, manual WAA signer server switching, API key management, and dynamic log/dump settings.
+- **Settings**: Online editor for `config.yaml` with instant hot-reloading, local WAA IPC signer status, API key management, and dynamic log/dump settings.
 - **Access Control**: Enable authentication by setting `AISTUDIO_WEB_PASSWORD`.
 
 ---
@@ -405,10 +401,11 @@ Python quality checks and tests:
 # Run code style & lint check
 uv run ruff check .
 # Run static type checking
-bun x pyright src tests
-
-# Run test suite
+uv tool run pyright src tests
+# Run Python test suite
 uv run pytest
+# Run Go WAA signer unit tests
+bash waa-signer/build.sh --test
 ```
 
 ---

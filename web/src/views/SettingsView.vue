@@ -7,7 +7,6 @@ import ApiKeyManagerCard from '@/components/settings/ApiKeyManagerCard.vue'
 import LogConfigCard from '@/components/settings/LogConfigCard.vue'
 import FeaturesCard from '@/components/settings/FeaturesCard.vue'
 import VisualConfigEditor from '@/components/config/VisualConfigEditor.vue'
-import SignerServerCard from '@/components/settings/SignerServerCard.vue'
 import {
   Server,
   CheckCircle2,
@@ -58,8 +57,11 @@ onMounted(() => {
         <div class="text-base font-bold text-gray-900 font-mono">
           :{{ config?.port || 8080 }}
         </div>
-        <div class="text-[11px] text-gray-400 mt-1">
-          HTTP 服务监听端口
+        <div
+          class="text-[11px] mt-1"
+          :class="config?.signer_ready ? 'text-emerald-600' : 'text-amber-600'"
+        >
+          WAA 本地 IPC: {{ config?.signer_ready ? '已就绪' : '未编译' }}
         </div>
       </div>
 
@@ -144,9 +146,6 @@ onMounted(() => {
 
     <!-- Feature Toggles Card (ATG / OpenAI / Keepalive) -->
     <FeaturesCard />
-
-    <!-- WAA Signer Servers & Features Binding Card -->
-    <SignerServerCard @switched="loadConfig" />
 
     <!-- API Key Management Card -->
     <ApiKeyManagerCard />

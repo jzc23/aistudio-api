@@ -240,19 +240,12 @@ class Auth403RetryManager:
         request_ctx: SessionContext | None,
     ) -> str:
         """403 诊断上下文:账号/签名服务/worker 池/UA,定位 403 根因。"""
-        signer_id = "unknown"
-        outer_ua = ""
-        pool_state = ""
-        try:
-            from aistudio_api.infrastructure.gateway.model_defaults import (
-                get_active_waa_server,
-            )
+        from aistudio_api.infrastructure.account.cookie_parser import (
+            DEFAULT_BROWSER_USER_AGENT,
+        )
 
-            waa_cfg = get_active_waa_server()
-            signer_id = str(waa_cfg.get("id") or "unknown")
-            outer_ua = str(waa_cfg.get("user_agent") or "")
-        except Exception:
-            pass
+        outer_ua = DEFAULT_BROWSER_USER_AGENT
+        pool_state = ""
         if prepared is not None and isinstance(prepared.headers, dict):
             outer_ua = str(prepared.headers.get("User-Agent") or outer_ua)
         session = getattr(client, "session", None)
@@ -267,7 +260,7 @@ class Auth403RetryManager:
         )
         return (
             f"account={acc_id or 'unknown'}(u/{auth_user}), "
-            f"signer={signer_id}, pool={pool_state or 'unknown'}, "
+            f"signer=local_ipc, pool={pool_state or 'unknown'}, "
             f"ua={outer_ua[:48] or 'default'}"
         )
 
