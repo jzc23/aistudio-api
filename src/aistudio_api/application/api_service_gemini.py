@@ -43,6 +43,7 @@ from aistudio_api.application.generation_core import (
     SHORT_RATE_LIMIT_COOLDOWN_SECONDS,
     WIRE_TO_GEMINI_FINISH_REASON,
     Auth403RetryManager,
+    _effective_max_retries,
     _is_prepared_binding_current,
     _record_request_rotator_event,
     _request_context_snapshot,
@@ -70,6 +71,7 @@ logger = get_logger("api.gemini")
 
 __all__ = [
     "AUTH_403_MAX_RETRIES",
+    "MAX_RETRIES",
     "SHORT_RATE_LIMIT_COOLDOWN_SECONDS",
     "WIRE_TO_GEMINI_FINISH_REASON",
     "Auth403RetryManager",
@@ -390,7 +392,8 @@ async def handle_gemini_decisions(
 ) -> GeminiCreateDecisionResponse:
     last_error: Exception | None = None
     auth_manager = Auth403RetryManager()
-    total_attempts = MAX_RETRIES + AUTH_403_MAX_RETRIES
+    max_retries = _effective_max_retries()
+    total_attempts = max_retries + AUTH_403_MAX_RETRIES
     ordinary_attempt = 0
     raw_model = req.model or "gemini-decision-1"
     norm_model = raw_model if raw_model.startswith("models/") else f"models/{raw_model}"
@@ -400,8 +403,8 @@ async def handle_gemini_decisions(
     }
 
     for attempt in range(total_attempts):
-        # 403 重试单独计数,普通失败共用 MAX_RETRIES 预算(上游 fcdc53e/PR #21)
-        if ordinary_attempt >= MAX_RETRIES:
+        # 403 重试单独计数,普通失败共用普通预算(上游 fcdc53e/PR #21)
+        if ordinary_attempt >= max_retries:
             break
         ensured_ctx = await ensure_active_account(attempt, model=norm_model)
         effective_ctx = auth_manager.pinned_ctx or (
@@ -558,7 +561,7 @@ async def handle_gemini_count_tokens(
 
     normalized = normalize_gemini_request(effective_req, model_path)
     last_error: Exception | None = None
-    for attempt in range(MAX_RETRIES):
+    for attempt in range(_effective_max_retries()):
         ensured_ctx = await ensure_active_account(attempt, model=normalized.model)
         # 在请求进入客户端前绑定实际账号,失败时不读取已切换的全局会话
         request_ctx = (

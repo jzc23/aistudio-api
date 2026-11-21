@@ -262,8 +262,6 @@ class LocalSignerProcess:
     @staticmethod
     def _build_child_env() -> dict[str, str]:
         child_env = os.environ.copy()
-        if sys.platform == "win32":
-            return child_env
         if _is_termux_env(child_env):
             # Statically linked Linux musl binary must not inherit Termux Bionic preload/library overrides.
             if "com.termux" in child_env.get("LD_PRELOAD", ""):
