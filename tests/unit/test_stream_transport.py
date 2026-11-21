@@ -161,3 +161,23 @@ def test_transport_read_timeout_default_and_env(monkeypatch):
     monkeypatch.setenv("AISTUDIO_UPSTREAM_READ_TIMEOUT", "abc")
     t3 = HTTPStreamTransport()
     assert t3.read_timeout == 600.0
+
+
+async def test_transport_sanitizes_lone_utf16_surrogates():
+    """Verify lone UTF-16 surrogates in request body never raise UnicodeEncodeError."""
+    transport = HTTPStreamTransport()
+    captured: list[bytes] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request.content)
+        return httpx.Response(200, content=b"ok")
+
+    transport._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    status, _ = await transport.send_request(
+        url="https://example.com/api",
+        headers={},
+        body='{"text":"broken \ud83d emoji"}',
+    )
+    assert status == 200
+    assert len(captured) == 1
+    assert captured[0] == b'{"text":"broken ? emoji"}'
